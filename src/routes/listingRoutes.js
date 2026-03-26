@@ -4,7 +4,7 @@ const Listing = require('../models/Listing');
 const Report = require('../models/Report');
 const Notification = require('../models/Notification');
 const Message = require('../models/Message');
-const { auth, adminOnly } = require('../middleware/auth');
+const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
 const { detectScamText } = require('../utils/scamCheck');
 const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
 const { sendEmail } = require('../utils/sendEmail');
@@ -54,13 +54,45 @@ function getPublicSort(sort = 'newest') {
   return { isFeatured: -1, featuredUntil: -1, createdAt: -1 };
 }
 
-function applySaleStatusEffects(listing, saleStatus) {
-  const hasActivePremium = listing.premiumPaymentStatus === 'paid' && listing.featuredUntil && listing.featuredUntil > new Date();
+function hasActiveSellerPremium(user) {
+  return Boolean(
+    user?.premiumStatus === 'active' &&
+    user?.premiumExpiresAt &&
+    new Date(user.premiumExpiresAt) > new Date()
+  );
+}
 
+function syncListingPremiumState(listing, user) {
+  const hasPremium = hasActiveSellerPremium(user);
+
+  if (!hasPremium) {
+    listing.isFeatured = false;
+    listing.isVerified = false;
+
+    if (!listing.featuredUntil || new Date(listing.featuredUntil) <= new Date()) {
+      listing.featuredUntil = null;
+      listing.premiumPaymentStatus = 'unpaid';
+      listing.premiumRequested = false;
+      listing.paystackReference = '';
+    }
+
+    return;
+  }
+
+  listing.premiumRequested = true;
+  listing.premiumPaymentStatus = 'paid';
+  listing.paystackReference = user.premiumReference || listing.paystackReference;
+  listing.featuredUntil = new Date(user.premiumExpiresAt);
+
+  const shouldSurfacePremium = listing.saleStatus === 'available' && listing.status === 'approved';
+  listing.isFeatured = shouldSurfacePremium;
+  listing.isVerified = shouldSurfacePremium;
+}
+
+function applySaleStatusEffects(listing, saleStatus, user) {
   listing.saleStatus = saleStatus;
   listing.soldAt = saleStatus === 'sold' ? new Date() : null;
-  listing.isFeatured = saleStatus === 'available' ? Boolean(hasActivePremium) : false;
-  listing.isVerified = saleStatus === 'available' ? Boolean(hasActivePremium) : false;
+  syncListingPremiumState(listing, user);
 }
 
 async function cleanupDeletedListing(listingId) {
@@ -145,7 +177,7 @@ router.get('/', async (req, res) => {
 });
 
 router.get('/:id', async (req, res) => {
-  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar');
+  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar premiumStatus premiumExpiresAt');
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
   res.json(listing);
 });
@@ -204,11 +236,10 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     status: moderationStatus,
     rejectionReason,
     saleStatus: 'available',
-    premiumRequested: false,
-    premiumPaymentStatus: 'unpaid',
-    isFeatured: false,
-    isVerified: false,
   });
+
+  syncListingPremiumState(listing, req.user);
+  await listing.save();
 
   await Notification.create({
     type: 'submission',
@@ -287,6 +318,7 @@ router.patch('/:id', auth, upload.array('photos', 4), async (req, res) => {
   listing.status = moderationStatus;
   listing.rejectionReason = rejectionReason;
 
+  syncListingPremiumState(listing, req.user);
   await listing.save();
   res.json(listing);
 });
@@ -300,7 +332,7 @@ router.patch('/:id/sale-status', auth, async (req, res) => {
     return res.status(400).json({ message: 'Invalid sale status supplied.' });
   }
 
-  applySaleStatusEffects(listing, saleStatus);
+  applySaleStatusEffects(listing, saleStatus, req.user);
   await listing.save();
 
   res.json(listing);
@@ -330,6 +362,7 @@ router.patch('/:id/status', auth, adminOnly, async (req, res) => {
     return res.status(400).json({ message: 'Invalid action' });
   }
 
+  syncListingPremiumState(listing, listing.user);
   await listing.save();
 
   await Notification.create({
@@ -356,6 +389,10 @@ router.post('/:id/reviews', auth, async (req, res) => {
   const listing = await Listing.findById(req.params.id);
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
 
+  if (listing.user.toString() === req.user._id.toString()) {
+    return res.status(400).json({ message: 'You cannot review or rate your own listing.' });
+  }
+
   const existing = listing.reviews.find((review) => review.user?.toString() === req.user._id.toString());
   if (existing) return res.status(400).json({ message: 'You already reviewed this listing' });
 
@@ -371,11 +408,15 @@ router.post('/:id/reviews', auth, async (req, res) => {
   res.status(201).json(listing);
 });
 
-router.post('/:id/report', async (req, res) => {
+router.post('/:id/report', optionalAuth, async (req, res) => {
   const { reporterName, reporterEmail, reason } = req.body;
   if (!reporterName || !reason) return res.status(400).json({ message: 'Reporter name and reason are required' });
   const listing = await Listing.findById(req.params.id);
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
+
+  if (req.user && listing.user.toString() === req.user._id.toString()) {
+    return res.status(400).json({ message: 'You cannot report your own listing.' });
+  }
 
   const report = await Report.create({
     listing: listing._id,

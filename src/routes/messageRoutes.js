@@ -2,21 +2,26 @@ const express = require('express');
 const Message = require('../models/Message');
 const Listing = require('../models/Listing');
 const Notification = require('../models/Notification');
-const { auth } = require('../middleware/auth');
+const { auth, optionalAuth } = require('../middleware/auth');
 const { sendEmail } = require('../utils/sendEmail');
 
 const router = express.Router();
 
-router.post('/contact/:listingId', async (req, res) => {
+router.post('/contact/:listingId', optionalAuth, async (req, res) => {
   const { senderName, senderEmail, senderPhone, message } = req.body;
   if (!senderName || !message) return res.status(400).json({ message: 'Name and message are required' });
 
   const listing = await Listing.findById(req.params.listingId).populate('user');
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
 
+  if (req.user && listing.user?._id?.toString() === req.user._id.toString()) {
+    return res.status(400).json({ message: 'You cannot contact yourself about your own listing.' });
+  }
+
   const record = await Message.create({
     listing: listing._id,
     toUser: listing.user._id,
+    fromUser: req.user?._id,
     senderName,
     senderEmail,
     senderPhone,
