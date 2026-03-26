@@ -16,14 +16,63 @@ function sanitizeWhatsapp(value = '') {
   return value.replace(/[^\d]/g, '');
 }
 
+function toBase64Photos(files = []) {
+  return files.map((file) => `data:${file.mimetype};base64,${file.buffer.toString('base64')}`);
+}
+
 function updateRatingStats(listing) {
   const total = listing.reviews.reduce((sum, review) => sum + review.rating, 0);
   listing.reviewsCount = listing.reviews.length;
   listing.averageRating = listing.reviews.length ? Number((total / listing.reviews.length).toFixed(1)) : 0;
 }
 
+function isValidCategory(category) {
+  return CATEGORIES.includes(category);
+}
+
+function parsePhotosField(rawValue) {
+  if (!rawValue) return [];
+  if (Array.isArray(rawValue)) return rawValue.filter(Boolean);
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function getPublicSort(sort = 'newest') {
+  if (sort === 'highest_rated') {
+    return { isFeatured: -1, featuredUntil: -1, averageRating: -1, createdAt: -1 };
+  }
+
+  if (sort === 'lowest_price') {
+    return { isFeatured: -1, featuredUntil: -1, startingPrice: 1, createdAt: -1 };
+  }
+
+  return { isFeatured: -1, featuredUntil: -1, createdAt: -1 };
+}
+
+function applySaleStatusEffects(listing, saleStatus) {
+  const hasActivePremium = listing.premiumPaymentStatus === 'paid' && listing.featuredUntil && listing.featuredUntil > new Date();
+
+  listing.saleStatus = saleStatus;
+  listing.soldAt = saleStatus === 'sold' ? new Date() : null;
+  listing.isFeatured = saleStatus === 'available' ? Boolean(hasActivePremium) : false;
+  listing.isVerified = saleStatus === 'available' ? Boolean(hasActivePremium) : false;
+}
+
+async function cleanupDeletedListing(listingId) {
+  await Promise.all([
+    Message.deleteMany({ listing: listingId }),
+    Report.deleteMany({ listing: listingId }),
+    Notification.deleteMany({ 'meta.listingId': String(listingId) }),
+  ]);
+}
+
 router.get('/meta/options', async (_req, res) => {
-  const approved = await Listing.find({ status: 'approved' }).select('category state');
+  const approved = await Listing.find({ status: 'approved', saleStatus: 'available' }).select('category state');
   const categoryCounts = CATEGORIES.map((name) => ({
     name,
     count: approved.filter((item) => item.category === name).length,
@@ -36,10 +85,17 @@ router.get('/meta/options', async (_req, res) => {
 });
 
 router.get('/featured', async (_req, res) => {
-  const featured = await Listing.find({ status: 'approved', isFeatured: true })
-    .sort({ createdAt: -1 })
+  const featured = await Listing.find({
+    status: 'approved',
+    saleStatus: 'available',
+    isFeatured: true,
+    premiumPaymentStatus: 'paid',
+    featuredUntil: { $gt: new Date() },
+  })
+    .sort({ featuredUntil: -1, createdAt: -1 })
     .limit(12)
     .populate('user', 'name avatar');
+
   res.json(featured);
 });
 
@@ -64,12 +120,15 @@ router.get('/', async (req, res) => {
     category,
     sort = 'newest',
     status = 'approved',
+    saleStatus = 'available',
   } = req.query;
 
   const query = {};
   if (status) query.status = status;
+  if (saleStatus && saleStatus !== 'All') query.saleStatus = saleStatus;
   if (state && state !== 'All States') query.state = state;
   if (category && category !== 'All Categories') query.category = category;
+
   if (search) {
     query.$or = [
       { title: { $regex: search, $options: 'i' } },
@@ -78,11 +137,10 @@ router.get('/', async (req, res) => {
     ];
   }
 
-  let sortQuery = { createdAt: -1 };
-  if (sort === 'highest_rated') sortQuery = { averageRating: -1, createdAt: -1 };
-  if (sort === 'lowest_price') sortQuery = { startingPrice: 1, createdAt: -1 };
+  const listings = await Listing.find(query)
+    .populate('user', 'name avatar')
+    .sort(getPublicSort(sort));
 
-  const listings = await Listing.find(query).populate('user', 'name avatar').sort(sortQuery);
   res.json(listings);
 });
 
@@ -105,22 +163,26 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     whatsapp,
     email,
     phone,
-    premiumRequested,
     safetyAccepted,
   } = req.body;
 
-  if (!title || !category || !description || !state || !city || !startingPrice || !priceLabel || !whatsapp) {
+  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
     return res.status(400).json({ message: 'All required fields must be filled' });
   }
+
+  if (!isValidCategory(category)) {
+    return res.status(400).json({ message: 'Please choose a valid category.' });
+  }
+
   if (String(safetyAccepted) !== 'true') {
     return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
   }
 
-  const photos = (req.files || []).map((file) => `data:${file.mimetype};base64,${file.buffer.toString('base64')}`);
+  const photos = toBase64Photos(req.files || []);
   if (!photos.length) return res.status(400).json({ message: 'At least one photo is required' });
 
   const scamHit = detectScamText(`${title} ${description}`);
-  const status = scamHit ? 'rejected' : 'pending';
+  const moderationStatus = scamHit ? 'rejected' : 'pending';
   const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
 
   const listing = await Listing.create({
@@ -139,25 +201,117 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
       email: email || '',
       phone: phone || '',
     },
-    premiumRequested: premiumRequested === 'true',
-    status,
+    status: moderationStatus,
     rejectionReason,
+    saleStatus: 'available',
+    premiumRequested: false,
+    premiumPaymentStatus: 'unpaid',
+    isFeatured: false,
+    isVerified: false,
   });
 
   await Notification.create({
     type: 'submission',
     title: 'New listing submitted',
     message: `${title} was submitted in ${city}, ${state}`,
-    meta: { listingId: listing._id.toString(), status },
+    meta: { listingId: listing._id.toString(), status: moderationStatus },
   });
 
   await sendEmail({
     to: process.env.ADMIN_EMAIL || 'peezutech@gmail.com',
     subject: `PeezuHub listing submitted: ${title}`,
-    html: `<p>A new listing was submitted.</p><p><strong>${title}</strong><br/>${city}, ${state}<br/>Status: ${status}</p>`,
+    html: `<p>A new listing was submitted.</p><p><strong>${title}</strong><br/>${city}, ${state}<br/>Status: ${moderationStatus}</p>`,
   });
 
-  res.status(201).json({ listing, paymentNeeded: listing.premiumRequested });
+  res.status(201).json({ listing, paymentNeeded: false });
+});
+
+router.patch('/:id', auth, upload.array('photos', 4), async (req, res) => {
+  const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
+  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+
+  const {
+    title,
+    category,
+    description,
+    state,
+    city,
+    locationLabel,
+    startingPrice,
+    priceLabel,
+    whatsapp,
+    email,
+    phone,
+    keepPhotos,
+    safetyAccepted,
+  } = req.body;
+
+  const preservedPhotos = parsePhotosField(keepPhotos);
+  const uploadedPhotos = toBase64Photos(req.files || []);
+  const nextPhotos = [...preservedPhotos, ...uploadedPhotos].slice(0, 4);
+
+  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
+    return res.status(400).json({ message: 'All required fields must be filled' });
+  }
+
+  if (!isValidCategory(category)) {
+    return res.status(400).json({ message: 'Please choose a valid category.' });
+  }
+
+  if (String(safetyAccepted) !== 'true') {
+    return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
+  }
+
+  if (!nextPhotos.length) {
+    return res.status(400).json({ message: 'Keep at least one photo or upload a new one.' });
+  }
+
+  const scamHit = detectScamText(`${title} ${description}`);
+  const moderationStatus = scamHit ? 'rejected' : 'pending';
+  const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
+
+  listing.title = title;
+  listing.category = category;
+  listing.description = description;
+  listing.state = state;
+  listing.city = city;
+  listing.locationLabel = locationLabel || '';
+  listing.startingPrice = Number(startingPrice);
+  listing.priceLabel = priceLabel;
+  listing.photos = nextPhotos;
+  listing.contact = {
+    whatsapp: sanitizeWhatsapp(whatsapp),
+    email: email || '',
+    phone: phone || '',
+  };
+  listing.status = moderationStatus;
+  listing.rejectionReason = rejectionReason;
+
+  await listing.save();
+  res.json(listing);
+});
+
+router.patch('/:id/sale-status', auth, async (req, res) => {
+  const { saleStatus } = req.body;
+  const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
+  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+
+  if (!['available', 'sold'].includes(saleStatus)) {
+    return res.status(400).json({ message: 'Invalid sale status supplied.' });
+  }
+
+  applySaleStatusEffects(listing, saleStatus);
+  await listing.save();
+
+  res.json(listing);
+});
+
+router.delete('/:id', auth, async (req, res) => {
+  const listing = await Listing.findOneAndDelete({ _id: req.params.id, user: req.user._id });
+  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+
+  await cleanupDeletedListing(listing._id);
+  res.json({ message: 'Listing deleted successfully.' });
 });
 
 router.patch('/:id/status', auth, adminOnly, async (req, res) => {

@@ -1,10 +1,3 @@
-// FIX #1 – Payment route fixes:
-//  • Env-var name normalised: reads PAYSTACK_SECRET_KEY first, then falls back
-//    to PAYSTACK_SECRET (matches the Railway env var shown in your dashboard).
-//  • Every async operation is wrapped in try/catch with next(err) so errors
-//    are forwarded to the global handler instead of crashing silently.
-//  • Added timeout on Paystack API calls to avoid hanging requests.
-
 const express = require('express');
 const axios = require('axios');
 const Listing = require('../models/Listing');
@@ -12,11 +5,9 @@ const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Accept either PAYSTACK_SECRET_KEY or PAYSTACK_SECRET (Railway naming)
 const getPaystackSecret = () =>
   process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || null;
 
-// ── POST /api/payments/paystack/initialize ────────────────────────────────────
 router.post('/paystack/initialize', auth, async (req, res, next) => {
   try {
     const paystackSecret = getPaystackSecret();
@@ -34,6 +25,14 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
       return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
     }
 
+    if (listing.saleStatus === 'sold') {
+      return res.status(400).json({ message: 'Sold listings cannot be upgraded. Mark it as available first.' });
+    }
+
+    if (listing.isFeatured && listing.featuredUntil && listing.featuredUntil > new Date()) {
+      return res.status(400).json({ message: 'This listing already has an active premium upgrade.' });
+    }
+
     const reference = `PZH-${Date.now()}-${listing._id}`;
     const clientUrl = process.env.CLIENT_URL?.split(',')[0]?.trim() || 'http://localhost:5173';
     const callbackUrl = `${clientUrl}/payment/callback?reference=${reference}&listingId=${listing._id}`;
@@ -42,7 +41,7 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
       'https://api.paystack.co/transaction/initialize',
       {
         email: req.user.email,
-        amount: 500000, // ₦5,000 in kobo
+        amount: 500000,
         currency: 'NGN',
         reference,
         callback_url: callbackUrl,
@@ -78,8 +77,7 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
   }
 });
 
-// ── GET /api/payments/paystack/verify/:reference ──────────────────────────────
-router.get('/paystack/verify/:reference', async (req, res, next) => {
+router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
   try {
     const paystackSecret = getPaystackSecret();
     if (!paystackSecret) {
@@ -98,16 +96,16 @@ router.get('/paystack/verify/:reference', async (req, res, next) => {
 
     const data = response.data.data;
 
-    const listing = await Listing.findOne({ paystackReference: reference });
+    const listing = await Listing.findOne({ paystackReference: reference, user: req.user._id });
     if (!listing) {
-      return res.status(404).json({ message: 'Payment reference not found for any listing.' });
+      return res.status(404).json({ message: 'Payment reference not found for your listing.' });
     }
 
     if (data.status === 'success') {
       listing.premiumRequested = true;
       listing.premiumPaymentStatus = 'paid';
-      listing.isFeatured = true;
-      listing.isVerified = true;
+      listing.isFeatured = listing.saleStatus !== 'sold';
+      listing.isVerified = listing.saleStatus !== 'sold';
       listing.featuredUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
       await listing.save();
     }
