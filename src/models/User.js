@@ -8,6 +8,12 @@ const userSchema = new mongoose.Schema(
     googleId: { type: String },
     avatar: { type: String, default: '' },
     role: { type: String, enum: ['user', 'admin'], default: 'user' },
+    premiumPlan: { type: String, enum: ['none', 'seller_premium'], default: 'none' },
+    premiumStatus: { type: String, enum: ['inactive', 'pending', 'active'], default: 'inactive' },
+    premiumReference: { type: String, default: '' },
+    premiumActivatedAt: { type: Date, default: null },
+    premiumExpiresAt: { type: Date, default: null },
+    premiumAmount: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
