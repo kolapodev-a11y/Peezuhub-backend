@@ -1,19 +1,29 @@
 const NIGERIAN_STATES = [
   'All States',
+  'Ondo',
+  'Oyo',
   'Lagos',
+  'Ekiti',
+  'Osun',
+  'Ogun',
+  'ilorin',
+  'Kogi',
+  'Cross river',
   'Abuja FCT',
   'Rivers',
   'Kano',
-  'Ondo',
-  'Oyo',
   'Enugu',
   'Delta',
-  'Ogun',
   'Kaduna',
   'Anambra',
   'Edo',
   'Akwa Ibom',
-  'Plateau'
+  'Plateau',
+  'Benin',
+  'Porthacourt',
+  'Niger'
+  
+
 ];
 
 const CATEGORIES = [
@@ -25,9 +35,10 @@ const CATEGORIES = [
   'Second-hand Phones',
   'Fashion & Clothing',
   'Photography & Video',
-  'Beauty & Wellness',
+  'Beauty & Bodycare',
   'Poultry Sales',
-  'Furniture & Home Furniture Sales'
+  'Furniture & Home Furniture Sales',
+  'Gaming Console'
 ];
 
 const SCAM_KEYWORDS = [
