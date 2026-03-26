@@ -17,18 +17,17 @@ const NIGERIAN_STATES = [
 ];
 
 const CATEGORIES = [
-  'Web & Software Development',
   'Graphic Design',
   'Food Delivery',
-  'Land/Car/House Sales',
+  'Car Sales',
+  'House Sales',
+  'Land Sales',
   'Second-hand Phones',
-  'Phone Repair/Testing',
   'Fashion & Clothing',
-  'Tutoring & Education',
   'Photography & Video',
-  'Events & Rentals',
   'Beauty & Wellness',
-  'Home Services'
+  'Poultry Sales',
+  'Furniture & Home Furniture Sales'
 ];
 
 const SCAM_KEYWORDS = [
