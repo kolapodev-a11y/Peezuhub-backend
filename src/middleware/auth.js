@@ -1,19 +1,29 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
-async function auth(req, res, next) {
-  const header = req.headers.authorization || '';
+async function resolveUserFromHeader(header = '') {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ message: 'Authentication required' });
+  if (!token) return null;
+
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id).select('-passwordHash');
-    if (!user) return res.status(401).json({ message: 'Invalid session' });
-    req.user = user;
-    next();
-  } catch (error) {
-    return res.status(401).json({ message: 'Invalid token' });
+    return user || null;
+  } catch {
+    return null;
   }
+}
+
+async function auth(req, res, next) {
+  const user = await resolveUserFromHeader(req.headers.authorization || '');
+  if (!user) return res.status(401).json({ message: 'Authentication required' });
+  req.user = user;
+  next();
+}
+
+async function optionalAuth(req, _res, next) {
+  req.user = await resolveUserFromHeader(req.headers.authorization || '');
+  next();
 }
 
 function adminOnly(req, res, next) {
@@ -23,4 +33,4 @@ function adminOnly(req, res, next) {
   next();
 }
 
-module.exports = { auth, adminOnly };
+module.exports = { auth, optionalAuth, adminOnly };
