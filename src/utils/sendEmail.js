@@ -2,81 +2,117 @@
 /**
  * PeezuHub – sendEmail utility
  * ----------------------------
- * Wraps nodemailer.  Reads SMTP_* environment variables.
- * Silently returns false when SMTP is not configured (prevents boot crash).
+ * Wraps nodemailer and keeps outbound email from blocking core user flows.
+ * Supports standard SMTP_* variables and optional SMTP_SERVICE (e.g. gmail).
  */
 
 const nodemailer = require('nodemailer');
 
-let _transporter = null;
+let transporter = null;
+
+function normalizeRecipients(value) {
+  if (!value) return [];
+
+  if (Array.isArray(value)) {
+    return [...new Set(value.map((item) => String(item).trim()).filter(Boolean))];
+  }
+
+  return [...new Set(String(value).split(',').map((item) => item.trim()).filter(Boolean))];
+}
+
+function getFromAddress() {
+  if (process.env.SMTP_FROM?.trim()) return process.env.SMTP_FROM.trim();
+  if (process.env.SMTP_USER?.trim()) return `${process.env.APP_NAME || 'PeezuHub'} <${process.env.SMTP_USER.trim()}>`;
+  return undefined;
+}
 
 function getTransporter() {
-  if (_transporter) return _transporter;
+  if (transporter) return transporter;
 
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+  const {
+    SMTP_SERVICE,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USER,
+    SMTP_PASS,
+  } = process.env;
 
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
-    console.warn('[PeezuHub] SMTP not fully configured – emails disabled.');
+  if (!SMTP_USER || !SMTP_PASS || (!SMTP_SERVICE && !SMTP_HOST)) {
+    console.warn('[PeezuHub] SMTP not fully configured - emails will be skipped.');
     return null;
   }
 
-  const port   = Number(SMTP_PORT);
-  const secure = port === 465; // SSL for 465, STARTTLS for 587
+  const port = Number(SMTP_PORT || 587);
+  const secure = port === 465;
 
-  _transporter = nodemailer.createTransport({
-    host:   SMTP_HOST,
-    port,
-    secure,
+  const transportConfig = {
     auth: { user: SMTP_USER, pass: SMTP_PASS },
-    // Helps with Gmail App Passwords
+    secure,
+    pool: true,
+    maxConnections: 1,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
+    dnsTimeout: 10_000,
     tls: { rejectUnauthorized: false },
-  });
+  };
 
-  return _transporter;
+  if (SMTP_SERVICE?.trim()) {
+    transportConfig.service = SMTP_SERVICE.trim();
+  } else {
+    transportConfig.host = SMTP_HOST;
+    transportConfig.port = port;
+  }
+
+  transporter = nodemailer.createTransport(transportConfig);
+  return transporter;
 }
 
-/**
- * Send an email.
- *
- * @param {object}          opts
- * @param {string|string[]} opts.to       – recipient address(es) or comma-separated string
- * @param {string}          opts.subject
- * @param {string}          opts.html     – HTML body
- * @param {string}         [opts.text]    – plain-text fallback (auto-stripped if omitted)
- * @returns {Promise<boolean>}            – true on success, false if skipped/failed
- */
-async function sendEmail({ to, subject, html, text }) {
-  if (!to || !subject || !html) {
-    console.warn('[PeezuHub] sendEmail: missing required fields (to / subject / html).');
+async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
+  const client = getTransporter();
+  const toList = normalizeRecipients(to);
+  const ccList = normalizeRecipients(cc);
+  const bccList = normalizeRecipients(bcc);
+
+  if (!subject || !html || !toList.length) {
+    console.warn('[PeezuHub] sendEmail skipped: missing recipient, subject or html body.');
     return false;
   }
 
-  const client = getTransporter();
   if (!client) return false;
-
-  // Normalise recipients – accept array or comma-separated string
-  const recipients = Array.isArray(to) ? to.join(', ') : to;
-
-  const from =
-    process.env.SMTP_FROM ||
-    `${process.env.APP_NAME || 'PeezuHub'} <${process.env.SMTP_USER}>`;
 
   try {
     await client.sendMail({
-      from,
-      to: recipients,
+      from: getFromAddress(),
+      to: toList.join(', '),
+      cc: ccList.length ? ccList.join(', ') : undefined,
+      bcc: bccList.length ? bccList.join(', ') : undefined,
+      replyTo: replyTo || undefined,
       subject,
       html,
-      // Strip HTML tags for a basic plain-text fallback when not supplied
       text: text || html.replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ').trim(),
     });
-    console.log(`[PeezuHub] Email sent → ${recipients} | Subject: ${subject}`);
+
+    console.log(`[PeezuHub] Email sent -> ${toList.join(', ')} | ${subject}`);
     return true;
-  } catch (err) {
-    // Log but do NOT rethrow – a failed email must never crash the HTTP response
-    console.error('[PeezuHub] sendEmail error:', err.message);
+  } catch (error) {
+    console.error(`[PeezuHub] sendEmail error (${subject}):`, error.message);
     return false;
   }
 }
 
-module.exports = { sendEmail };
+function queueEmail(payload) {
+  Promise.resolve()
+    .then(() => sendEmail(payload))
+    .catch((error) => {
+      console.error('[PeezuHub] queueEmail error:', error.message);
+    });
+
+  return true;
+}
+
+module.exports = {
+  sendEmail,
+  queueEmail,
+  normalizeRecipients,
+};

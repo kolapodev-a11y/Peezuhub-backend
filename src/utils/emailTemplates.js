@@ -232,7 +232,7 @@ function buildAdminAlertEmail({ title, intro, fields = [], actionLabel, actionUr
 function buildPremiumConfirmEmail({ userName, userEmail, reference, amountNaira, activatedAt, expiresAt }) {
   const expiryStr  = formatDateTime(expiresAt);
   const activatedStr = formatDateTime(activatedAt);
-  const dashboardUrl = `${CLIENT_URL}/dashboard`;
+  const dashboardUrl = `${CLIENT_URL}/profile`;
 
   const bodyHtml = `
     <!-- success badge -->
