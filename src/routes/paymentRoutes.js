@@ -5,6 +5,12 @@ const Notification = require('../models/Notification');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
 const { sendEmail } = require('../utils/sendEmail');
+const {
+  APP_NAME,
+  buildAdminAlertEmail,
+  formatDateTime,
+  getAdminNotificationRecipients,
+} = require('../utils/emailTemplates');
 
 const router = express.Router();
 
@@ -42,7 +48,7 @@ async function syncAllUserListingsPremium(userId, premiumExpiresAt, reference) {
   );
 
   await Listing.updateMany(
-    { user: userId, saleStatus: 'available' },
+    { user: userId, saleStatus: 'available', status: 'approved' },
     {
       $set: {
         isFeatured: true,
@@ -52,7 +58,13 @@ async function syncAllUserListingsPremium(userId, premiumExpiresAt, reference) {
   );
 
   await Listing.updateMany(
-    { user: userId, saleStatus: 'sold' },
+    {
+      user: userId,
+      $or: [
+        { saleStatus: 'sold' },
+        { status: { $ne: 'approved' } },
+      ],
+    },
     {
       $set: {
         isFeatured: false,
@@ -150,8 +162,19 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
     }
 
     if (payment.status === 'success') {
-      const activatedAt = new Date();
-      const expiresAt = new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
+      const alreadyActivatedForReference = Boolean(
+        user.premiumStatus === 'active' &&
+        user.premiumReference === reference &&
+        user.premiumExpiresAt &&
+        new Date(user.premiumExpiresAt) > new Date()
+      );
+
+      const activatedAt = alreadyActivatedForReference && user.premiumActivatedAt
+        ? new Date(user.premiumActivatedAt)
+        : new Date();
+      const expiresAt = alreadyActivatedForReference && user.premiumExpiresAt
+        ? new Date(user.premiumExpiresAt)
+        : new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000);
 
       user.premiumPlan = 'seller_premium';
       user.premiumStatus = 'active';
@@ -162,18 +185,37 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
 
       await syncAllUserListingsPremium(user._id, expiresAt, reference);
 
-      await Notification.create({
-        type: 'premium_upgrade_paid',
-        title: 'Seller premium activated',
-        message: `${user.name} completed a premium upgrade. All current and future listings should receive premium treatment until ${expiresAt.toLocaleDateString()}.`,
-        meta: { userId: user._id.toString(), reference, expiresAt: expiresAt.toISOString() },
-      });
+      if (!alreadyActivatedForReference) {
+        await Notification.create({
+          type: 'premium_upgrade_paid',
+          title: 'Seller premium activated',
+          message: `${user.name} completed a premium upgrade. All current and future listings should receive premium treatment until ${expiresAt.toLocaleDateString()}.`,
+          meta: { userId: user._id.toString(), reference, expiresAt: expiresAt.toISOString() },
+        });
 
-      await sendEmail({
-        to: process.env.ADMIN_EMAIL || 'peezutech@gmail.com',
-        subject: `PeezuHub premium upgrade paid: ${user.name}`,
-        html: `<p><strong>${user.name}</strong> successfully paid for seller premium.</p><p>Email: ${user.email}</p><p>Coverage: all current and future listings</p><p>Expires: ${expiresAt.toLocaleString()}</p>`,
-      });
+        const premiumEmail = buildAdminAlertEmail({
+          title: 'Premium upgrade payment received',
+          intro: `${user.name} completed a seller premium payment on ${APP_NAME}.`,
+          fields: [
+            { label: 'Member', value: user.name },
+            { label: 'Email', value: user.email },
+            { label: 'Reference', value: reference },
+            { label: 'Amount', value: `₦${PREMIUM_PRICE_NAIRA.toLocaleString('en-NG')}` },
+            { label: 'Plan', value: 'Seller premium (all current and future listings)' },
+            { label: 'Activated', value: formatDateTime(activatedAt) },
+            { label: 'Expires', value: formatDateTime(expiresAt) },
+          ],
+          actionLabel: 'Open admin dashboard',
+          footerNote: 'This email is sent only to configured PeezuHub admin recipients.',
+        });
+
+        await sendEmail({
+          to: getAdminNotificationRecipients(),
+          subject: `${APP_NAME} premium upgrade paid: ${user.name}`,
+          html: premiumEmail.html,
+          text: premiumEmail.text,
+        });
+      }
     }
 
     const listings = await Listing.find({ user: req.user._id }).sort({ createdAt: -1 });

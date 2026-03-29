@@ -8,6 +8,12 @@ const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
 const { detectScamText } = require('../utils/scamCheck');
 const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
 const { sendEmail } = require('../utils/sendEmail');
+const {
+  APP_NAME,
+  buildAdminAlertEmail,
+  formatDateTime,
+  getAdminNotificationRecipients,
+} = require('../utils/emailTemplates');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
@@ -248,10 +254,27 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     meta: { listingId: listing._id.toString(), status: moderationStatus },
   });
 
+  const newListingEmail = buildAdminAlertEmail({
+    title: 'New listing awaiting approval',
+    intro: `A new listing was submitted on ${APP_NAME} and is ready for moderation.`,
+    fields: [
+      { label: 'Title', value: title },
+      { label: 'Seller', value: req.user.name },
+      { label: 'Seller email', value: req.user.email },
+      { label: 'Location', value: `${city}, ${state}` },
+      { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
+      { label: 'Status', value: moderationStatus },
+      { label: 'Submitted', value: formatDateTime(listing.createdAt) },
+    ],
+    actionLabel: 'Review pending listings',
+    footerNote: 'Submitted listings stay pending until you approve them in the admin dashboard.',
+  });
+
   await sendEmail({
-    to: process.env.ADMIN_EMAIL || 'peezutech@gmail.com',
-    subject: `PeezuHub listing submitted: ${title}`,
-    html: `<p>A new listing was submitted.</p><p><strong>${title}</strong><br/>${city}, ${state}<br/>Status: ${moderationStatus}</p>`,
+    to: getAdminNotificationRecipients(),
+    subject: `${APP_NAME} listing submitted: ${title}`,
+    html: newListingEmail.html,
+    text: newListingEmail.text,
   });
 
   res.status(201).json({ listing, paymentNeeded: false });
@@ -372,14 +395,6 @@ router.patch('/:id/status', auth, adminOnly, async (req, res) => {
     meta: { listingId: listing._id.toString(), action },
   });
 
-  if (listing.user?.email) {
-    await sendEmail({
-      to: listing.user.email,
-      subject: `Your PeezuHub listing was ${action}d`,
-      html: `<p>Your listing <strong>${listing.title}</strong> was ${action}d.</p><p>${reason || 'Your listing is now live on PeezuHub.'}</p>`,
-    });
-  }
-
   res.json(listing);
 });
 
@@ -432,10 +447,25 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
     meta: { listingId: listing._id.toString(), reportId: report._id.toString() },
   });
 
+  const reportEmail = buildAdminAlertEmail({
+    title: 'Listing reported for review',
+    intro: `${reporterName} reported a listing on ${APP_NAME}.`,
+    fields: [
+      { label: 'Listing', value: listing.title },
+      { label: 'Reporter', value: reporterName },
+      { label: 'Reporter email', value: reporterEmail || 'Not provided' },
+      { label: 'Reason', value: reason },
+      { label: 'Reported', value: formatDateTime(report.createdAt) },
+    ],
+    actionLabel: 'Review reports',
+    footerNote: 'This notification goes only to the configured PeezuHub admin inbox.',
+  });
+
   await sendEmail({
-    to: process.env.ADMIN_EMAIL || 'peezutech@gmail.com',
-    subject: `PeezuHub report: ${listing.title}`,
-    html: `<p><strong>${reporterName}</strong> reported listing <strong>${listing.title}</strong>.</p><p>${reason}</p>`,
+    to: getAdminNotificationRecipients(),
+    subject: `${APP_NAME} report: ${listing.title}`,
+    html: reportEmail.html,
+    text: reportEmail.text,
   });
 
   res.status(201).json({ message: 'Report sent to admin successfully' });
