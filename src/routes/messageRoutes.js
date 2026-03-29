@@ -3,7 +3,7 @@ const Message = require('../models/Message');
 const Listing = require('../models/Listing');
 const Notification = require('../models/Notification');
 const { auth, optionalAuth } = require('../middleware/auth');
-const { sendEmail } = require('../utils/sendEmail');
+const { queueEmail } = require('../utils/sendEmail');
 
 const router = express.Router();
 
@@ -36,10 +36,11 @@ router.post('/contact/:listingId', optionalAuth, async (req, res) => {
   });
 
   if (listing.contact?.email) {
-    await sendEmail({
+    queueEmail({
       to: listing.contact.email,
       subject: `PeezuHub enquiry for ${listing.title}`,
       html: `<p><strong>${senderName}</strong> sent an enquiry on PeezuHub.</p><p>${message}</p><p>Email: ${senderEmail || '-'}<br/>Phone: ${senderPhone || '-'}</p>`,
+      replyTo: senderEmail || undefined,
     });
   }
 

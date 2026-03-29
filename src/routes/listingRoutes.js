@@ -7,7 +7,7 @@ const Message = require('../models/Message');
 const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
 const { detectScamText } = require('../utils/scamCheck');
 const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
-const { sendEmail } = require('../utils/sendEmail');
+const { queueEmail } = require('../utils/sendEmail');
 const {
   APP_NAME,
   buildAdminAlertEmail,
@@ -270,7 +270,7 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     footerNote: 'Submitted listings stay pending until you approve them in the admin dashboard.',
   });
 
-  await sendEmail({
+  queueEmail({
     to: getAdminNotificationRecipients(),
     subject: `${APP_NAME} listing submitted: ${title}`,
     html: newListingEmail.html,
@@ -461,7 +461,7 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
     footerNote: 'This notification goes only to the configured PeezuHub admin inbox.',
   });
 
-  await sendEmail({
+  queueEmail({
     to: getAdminNotificationRecipients(),
     subject: `${APP_NAME} report: ${listing.title}`,
     html: reportEmail.html,

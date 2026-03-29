@@ -16,7 +16,7 @@ const Listing    = require('../models/Listing');
 const Notification = require('../models/Notification');
 const User       = require('../models/User');
 const { auth }   = require('../middleware/auth');
-const { sendEmail } = require('../utils/sendEmail');
+const { queueEmail } = require('../utils/sendEmail');
 const {
   APP_NAME,
   buildAdminAlertEmail,
@@ -217,7 +217,7 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
           footerNote:  `This alert is sent only to configured ${APP_NAME} admin recipients.`,
         });
 
-        await sendEmail({
+        queueEmail({
           to:      getAdminNotificationRecipients(),
           subject: `[${APP_NAME}] Premium upgrade paid – ${user.name}`,
           html:    adminEmail.html,
@@ -234,7 +234,7 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
           expiresAt,
         });
 
-        await sendEmail({
+        queueEmail({
           to:      user.email,
           subject: `✅ Your ${APP_NAME} Seller Premium is now active!`,
           html:    buyerEmail.html,
