@@ -1,221 +1,239 @@
-'use strict';
-/**
- * PeezuHub – resilient SMTP mailer for Render/Gmail
- * -------------------------------------------------
- * Replace: src/utils/sendEmail.js
- *
- * Why this fix:
- * - avoids reusing stale pooled SMTP sockets on free/idle Render instances
- * - auto-detects Gmail transport when Gmail SMTP is used
- * - retries once on timeout / connection reset with a fresh transporter
- * - keeps email failures from crashing or blocking the main request flow
- *
- * Recommended env values for Gmail:
- * SMTP_HOST=smtp.gmail.com
- * SMTP_PORT=465
- * SMTP_USER=yourgmail@gmail.com
- * SMTP_PASS=your_16_char_app_password
- * SMTP_FROM=PeezuHub <yourgmail@gmail.com>
- */
+const axios = require('axios');
 
-const nodemailer = require('nodemailer');
+const DEFAULT_ADMIN_EMAIL = 'peezutech@gmail.com';
+const DEFAULT_BRAND_COLOR = '#2563eb';
+const APP_NAME = 'PeezuHub';
 
-function normalizeRecipients(value) {
-  if (!value) return [];
-
-  const items = Array.isArray(value)
-    ? value
-    : String(value)
-        .split(',')
-        .map((item) => item.trim())
-        .filter(Boolean);
-
-  return [...new Set(items.map((item) => String(item).trim()).filter(Boolean))];
+function getCourierApiKey() {
+  return process.env.COURIER_API_KEY || '';
 }
 
-function stripHtml(html = '') {
-  return String(html)
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function getAdminEmail() {
+  return process.env.ADMIN_EMAIL || DEFAULT_ADMIN_EMAIL;
 }
 
-function getFromAddress() {
-  if (process.env.SMTP_FROM && process.env.SMTP_FROM.trim()) {
-    return process.env.SMTP_FROM.trim();
-  }
-
-  if (process.env.SMTP_USER && process.env.SMTP_USER.trim()) {
-    return `${process.env.APP_NAME || 'PeezuHub'} <${process.env.SMTP_USER.trim()}>`;
-  }
-
-  return undefined;
+function getClientUrl(path = '') {
+  const base = process.env.CLIENT_URL?.split(',')[0]?.trim() || 'http://localhost:5173';
+  if (!path) return base;
+  return `${base}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
-function isGmailTransport({ service, host, user }) {
-  const normalizedService = String(service || '').trim().toLowerCase();
-  const normalizedHost = String(host || '').trim().toLowerCase();
-  const normalizedUser = String(user || '').trim().toLowerCase();
-
-  return (
-    normalizedService === 'gmail' ||
-    normalizedHost === 'smtp.gmail.com' ||
-    normalizedHost.endsWith('.gmail.com') ||
-    normalizedUser.endsWith('@gmail.com')
-  );
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
-function buildTransportConfig() {
-  const SMTP_SERVICE = (process.env.SMTP_SERVICE || '').trim();
-  const SMTP_HOST = (process.env.SMTP_HOST || '').trim();
-  const SMTP_USER = (process.env.SMTP_USER || '').trim();
-  const SMTP_PASS = (process.env.SMTP_PASS || '').trim();
-
-  if (!SMTP_USER || !SMTP_PASS || (!SMTP_SERVICE && !SMTP_HOST)) {
-    return null;
-  }
-
-  const gmailMode = isGmailTransport({
-    service: SMTP_SERVICE,
-    host: SMTP_HOST,
-    user: SMTP_USER,
+function formatDateTime(value) {
+  if (!value) return '—';
+  return new Date(value).toLocaleString('en-NG', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
   });
-
-  const fallbackPort = gmailMode ? 465 : 587;
-  const port = Number(process.env.SMTP_PORT || fallbackPort);
-  const secure = String(process.env.SMTP_SECURE || '').trim()
-    ? String(process.env.SMTP_SECURE).trim().toLowerCase() === 'true'
-    : port === 465;
-
-  const config = {
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-    secure,
-    pool: false,
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-    socketTimeout: 30000,
-    requireTLS: !secure,
-    tls: {
-      minVersion: 'TLSv1.2',
-      rejectUnauthorized: true,
-    },
-  };
-
-  if (gmailMode) {
-    config.service = 'gmail';
-  } else if (SMTP_SERVICE) {
-    config.service = SMTP_SERVICE;
-  } else {
-    config.host = SMTP_HOST;
-    config.port = port;
-    if (SMTP_HOST) {
-      config.tls.servername = SMTP_HOST;
-    }
-  }
-
-  if (!config.port && !config.service) {
-    config.port = port;
-  }
-
-  return config;
 }
 
-function createTransporter() {
-  const config = buildTransportConfig();
-  if (!config) {
-    console.warn('[PeezuHub] SMTP not fully configured - emails will be skipped.');
-    return null;
-  }
-
-  return nodemailer.createTransport(config);
+function normalizeLine(value = '') {
+  return String(value).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
 }
 
-function shouldRetryMailError(error) {
-  const code = String(error && error.code ? error.code : '').toUpperCase();
-  const command = String(error && error.command ? error.command : '').toUpperCase();
-  const message = String(error && error.message ? error.message : '').toLowerCase();
-
-  return (
-    ['ETIMEDOUT', 'ECONNECTION', 'ECONNRESET', 'ESOCKET', 'EPIPE'].includes(code) ||
-    command === 'CONN' ||
-    message.includes('timeout') ||
-    message.includes('connection reset') ||
-    message.includes('greeting never received') ||
-    message.includes('invalid greeting') ||
-    message.includes('socket closed')
-  );
+function renderRows(rows = []) {
+  return rows
+    .map(
+      (row) => `
+        <tr>
+          <td style="padding: 0 0 10px; vertical-align: top; width: 38%; color: #64748b; font-size: 13px; font-weight: 600;">${escapeHtml(row.label)}</td>
+          <td style="padding: 0 0 10px; vertical-align: top; color: #0f172a; font-size: 14px; line-height: 1.6; ${row.mono ? 'font-family: ui-monospace, SFMono-Regular, Menlo, monospace;' : ''}">${escapeHtml(row.value)}</td>
+        </tr>`
+    )
+    .join('');
 }
 
-async function deliverMail(client, mailOptions) {
-  return client.sendMail(mailOptions);
+function buildEmailTemplate({
+  badge,
+  title,
+  intro,
+  rows = [],
+  alert = '',
+  ctaLabel = '',
+  ctaUrl = '',
+  accentColor = DEFAULT_BRAND_COLOR,
+  footer = 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
+}) {
+  const textRows = rows.map((row) => `${row.label}: ${row.value}`).join('\n');
+  const text = [badge, title, normalizeLine(intro), textRows, alert, ctaUrl ? `${ctaLabel}: ${ctaUrl}` : '', footer]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const html = `
+    <div style="margin:0; padding:24px; background:#f8fafc; font-family:Inter,Arial,sans-serif; color:#0f172a;">
+      <div style="max-width:680px; margin:0 auto; background:#ffffff; border:1px solid #e2e8f0; border-radius:24px; overflow:hidden; box-shadow:0 12px 40px rgba(15,23,42,0.08);">
+        <div style="background:${accentColor}; padding:20px 24px; color:#ffffff;">
+          <div style="font-size:13px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; opacity:0.92;">${escapeHtml(APP_NAME)} Admin Alert</div>
+          <div style="margin-top:10px; display:inline-block; background:rgba(255,255,255,0.16); border:1px solid rgba(255,255,255,0.18); border-radius:999px; padding:6px 12px; font-size:12px; font-weight:700;">${escapeHtml(badge)}</div>
+          <h1 style="margin:16px 0 0; font-size:28px; line-height:1.2; font-weight:800; color:#ffffff;">${escapeHtml(title)}</h1>
+        </div>
+
+        <div style="padding:24px;">
+          <p style="margin:0 0 18px; font-size:15px; line-height:1.8; color:#334155;">${escapeHtml(intro)}</p>
+
+          <div style="border:1px solid #e2e8f0; border-radius:18px; padding:18px 18px 8px; background:#f8fafc;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+              ${renderRows(rows)}
+            </table>
+          </div>
+
+          ${alert ? `<div style="margin-top:18px; border-left:4px solid ${accentColor}; background:#eff6ff; padding:14px 16px; border-radius:14px; color:#1e3a8a; font-size:14px; line-height:1.7;">${escapeHtml(alert)}</div>` : ''}
+
+          ${ctaLabel && ctaUrl ? `
+            <div style="margin-top:24px;">
+              <a href="${escapeHtml(ctaUrl)}" style="display:inline-block; background:${accentColor}; color:#ffffff; text-decoration:none; padding:14px 20px; border-radius:14px; font-weight:700; font-size:14px;">${escapeHtml(ctaLabel)}</a>
+            </div>
+          ` : ''}
+
+          <div style="margin-top:24px; padding-top:18px; border-top:1px solid #e2e8f0; color:#64748b; font-size:12px; line-height:1.8;">
+            ${escapeHtml(footer)}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  return { html, text };
 }
 
-async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
-  const toList = normalizeRecipients(to);
-  const ccList = normalizeRecipients(cc);
-  const bccList = normalizeRecipients(bcc);
+async function sendCourierEmail({ to, subject, html, text }) {
+  const apiKey = getCourierApiKey();
+  if (!apiKey || !to) return false;
 
-  if (!toList.length || !subject || !html) {
-    console.warn('[PeezuHub] sendEmail skipped: missing recipient, subject or html body.');
-    return false;
-  }
-
-  const client = createTransporter();
-  if (!client) return false;
-
-  const mailOptions = {
-    from: getFromAddress(),
-    to: toList.join(', '),
-    cc: ccList.length ? ccList.join(', ') : undefined,
-    bcc: bccList.length ? bccList.join(', ') : undefined,
-    replyTo: replyTo || undefined,
+  const emailOverride = {
     subject,
     html,
-    text: text || stripHtml(html),
+    text,
+    tracking: { open: true },
   };
 
+  if (process.env.COURIER_FROM_EMAIL) {
+    emailOverride.from = process.env.COURIER_FROM_EMAIL;
+  }
+
+  if (process.env.COURIER_REPLY_TO) {
+    emailOverride.reply_to = process.env.COURIER_REPLY_TO;
+  }
+
   try {
-    await deliverMail(client, mailOptions);
-    console.log(`[PeezuHub] Email sent -> ${toList.join(', ')} | ${subject}`);
+    await axios.post(
+      'https://api.courier.com/send',
+      {
+        message: {
+          to: { email: to },
+          routing: {
+            method: 'single',
+            channels: ['email'],
+          },
+          content: {
+            title: subject,
+            body: text,
+          },
+          channels: {
+            email: {
+              override: emailOverride,
+            },
+          },
+        },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+      }
+    );
+
     return true;
   } catch (error) {
-    if (!shouldRetryMailError(error)) {
-      console.error(`[PeezuHub] sendEmail error (${subject}):`, error.message);
-      return false;
-    }
-
-    console.warn(`[PeezuHub] SMTP transient error, retrying once (${subject}): ${error.message}`);
-
-    try {
-      const retryClient = createTransporter();
-      if (!retryClient) return false;
-      await deliverMail(retryClient, mailOptions);
-      console.log(`[PeezuHub] Email sent on retry -> ${toList.join(', ')} | ${subject}`);
-      return true;
-    } catch (retryError) {
-      console.error(`[PeezuHub] sendEmail retry failed (${subject}):`, retryError.message);
-      return false;
-    }
+    console.error('[Courier Email Error]', error.response?.data || error.message);
+    return false;
   }
 }
 
-function queueEmail(payload) {
-  setImmediate(() => {
-    sendEmail(payload).catch((error) => {
-      console.error('[PeezuHub] queueEmail error:', error.message);
-    });
+async function sendAdminListingSubmittedEmail({ listing, ownerName, ownerEmail }) {
+  const subject = `PeezuHub admin review needed: ${listing.title}`;
+  const { html, text } = buildEmailTemplate({
+    badge: 'New listing submitted',
+    title: 'A new listing needs moderation',
+    intro: 'A user just submitted a listing on PeezuHub. Review it in the admin dashboard and decide whether to approve or reject it.',
+    rows: [
+      { label: 'Listing title', value: listing.title },
+      { label: 'Category', value: listing.category },
+      { label: 'Location', value: `${listing.city}, ${listing.state}` },
+      { label: 'Price', value: `₦${Number(listing.startingPrice || 0).toLocaleString('en-NG')}` },
+      { label: 'Seller', value: ownerName || 'Unknown user' },
+      { label: 'Seller email', value: ownerEmail || 'Not provided' },
+      { label: 'Moderation status', value: listing.status || 'pending' },
+      { label: 'Submitted at', value: formatDateTime(listing.createdAt || new Date()) },
+    ],
+    alert: 'Open the admin dashboard to verify the content, inspect the photos and take moderation action quickly.',
+    ctaLabel: 'Open admin dashboard',
+    ctaUrl: getClientUrl('/admin'),
   });
 
-  return true;
+  return sendCourierEmail({ to: getAdminEmail(), subject, html, text });
+}
+
+async function sendAdminListingReportedEmail({ listing, reporterName, reporterEmail, reason }) {
+  const subject = `PeezuHub report alert: ${listing.title}`;
+  const { html, text } = buildEmailTemplate({
+    badge: 'Listing reported',
+    title: 'A listing was reported by a user',
+    intro: 'A visitor flagged a listing for admin attention. Please inspect the listing details and decide whether additional moderation is required.',
+    rows: [
+      { label: 'Listing title', value: listing.title },
+      { label: 'Category', value: listing.category || '—' },
+      { label: 'Listing owner ID', value: listing.user?.toString?.() || listing.user || '—', mono: true },
+      { label: 'Reporter', value: reporterName },
+      { label: 'Reporter email', value: reporterEmail || 'Not provided' },
+      { label: 'Reason', value: reason },
+      { label: 'Reported at', value: formatDateTime(new Date()) },
+    ],
+    alert: 'Reports can indicate fraud, spam, duplicate content or unsafe buyer/seller behaviour. Review promptly.',
+    ctaLabel: 'Review admin dashboard',
+    ctaUrl: getClientUrl('/admin'),
+    accentColor: '#dc2626',
+  });
+
+  return sendCourierEmail({ to: getAdminEmail(), subject, html, text });
+}
+
+async function sendAdminPremiumUpgradeEmail({ user, reference, expiresAt }) {
+  const subject = `PeezuHub premium upgrade paid: ${user.name}`;
+  const { html, text } = buildEmailTemplate({
+    badge: 'Premium upgrade paid',
+    title: 'A seller premium payment was completed',
+    intro: 'A user successfully completed a premium upgrade. Their current and future listings should now receive premium treatment until the expiry date.',
+    rows: [
+      { label: 'User name', value: user.name },
+      { label: 'User email', value: user.email },
+      { label: 'Plan', value: 'Seller premium (all current and future listings)' },
+      { label: 'Reference', value: reference, mono: true },
+      { label: 'Expires', value: formatDateTime(expiresAt) },
+      { label: 'Paid at', value: formatDateTime(new Date()) },
+    ],
+    alert: 'You can verify the account status in the admin dashboard and confirm that listing badges/top placement are active.',
+    ctaLabel: 'Open admin dashboard',
+    ctaUrl: getClientUrl('/admin'),
+    accentColor: '#7c3aed',
+  });
+
+  return sendCourierEmail({ to: getAdminEmail(), subject, html, text });
 }
 
 module.exports = {
-  sendEmail,
-  queueEmail,
-  normalizeRecipients,
+  sendCourierEmail,
+  sendAdminListingSubmittedEmail,
+  sendAdminListingReportedEmail,
+  sendAdminPremiumUpgradeEmail,
 };
