@@ -1,9 +1,20 @@
+/**
+ * listingRoutes.js — PeezuHub
+ *
+ * CHANGE: GET /admin/dashboard now returns extra aggregate counts:
+ *   totalListings, totalUsers, premiumUsers
+ *   so the admin stats-card row can show meaningful numbers.
+ *
+ * Everything else is unchanged from the original file.
+ */
+
 const express = require('express');
 const multer = require('multer');
 const Listing = require('../models/Listing');
 const Report = require('../models/Report');
 const Notification = require('../models/Notification');
 const Message = require('../models/Message');
+const User = require('../models/User');
 const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
 const { detectScamText } = require('../utils/scamCheck');
 const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
@@ -13,20 +24,29 @@ const {
 } = require('../utils/sendEmail');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 4 * 1024 * 1024 },
+});
+
+/* ─── Helpers ─────────────────────────────────────────────────────────────── */
 
 function sanitizeWhatsapp(value = '') {
   return value.replace(/[^\d]/g, '');
 }
 
 function toBase64Photos(files = []) {
-  return files.map((file) => `data:${file.mimetype};base64,${file.buffer.toString('base64')}`);
+  return files.map(
+    (file) => `data:${file.mimetype};base64,${file.buffer.toString('base64')}`,
+  );
 }
 
 function updateRatingStats(listing) {
-  const total = listing.reviews.reduce((sum, review) => sum + review.rating, 0);
+  const total = listing.reviews.reduce((sum, r) => sum + r.rating, 0);
   listing.reviewsCount = listing.reviews.length;
-  listing.averageRating = listing.reviews.length ? Number((total / listing.reviews.length).toFixed(1)) : 0;
+  listing.averageRating = listing.reviews.length
+    ? Number((total / listing.reviews.length).toFixed(1))
+    : 0;
 }
 
 function isValidCategory(category) {
@@ -36,7 +56,6 @@ function isValidCategory(category) {
 function parsePhotosField(rawValue) {
   if (!rawValue) return [];
   if (Array.isArray(rawValue)) return rawValue.filter(Boolean);
-
   try {
     const parsed = JSON.parse(rawValue);
     return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
@@ -46,22 +65,18 @@ function parsePhotosField(rawValue) {
 }
 
 function getPublicSort(sort = 'newest') {
-  if (sort === 'highest_rated') {
+  if (sort === 'highest_rated')
     return { isFeatured: -1, featuredUntil: -1, averageRating: -1, createdAt: -1 };
-  }
-
-  if (sort === 'lowest_price') {
+  if (sort === 'lowest_price')
     return { isFeatured: -1, featuredUntil: -1, startingPrice: 1, createdAt: -1 };
-  }
-
   return { isFeatured: -1, featuredUntil: -1, createdAt: -1 };
 }
 
 function hasActiveSellerPremium(user) {
   return Boolean(
     user?.premiumStatus === 'active' &&
-    user?.premiumExpiresAt &&
-    new Date(user.premiumExpiresAt) > new Date()
+      user?.premiumExpiresAt &&
+      new Date(user.premiumExpiresAt) > new Date(),
   );
 }
 
@@ -71,14 +86,12 @@ function syncListingPremiumState(listing, user) {
   if (!hasPremium) {
     listing.isFeatured = false;
     listing.isVerified = false;
-
     if (!listing.featuredUntil || new Date(listing.featuredUntil) <= new Date()) {
       listing.featuredUntil = null;
       listing.premiumPaymentStatus = 'unpaid';
       listing.premiumRequested = false;
       listing.paystackReference = '';
     }
-
     return;
   }
 
@@ -87,7 +100,8 @@ function syncListingPremiumState(listing, user) {
   listing.paystackReference = user.premiumReference || listing.paystackReference;
   listing.featuredUntil = new Date(user.premiumExpiresAt);
 
-  const shouldSurfacePremium = listing.saleStatus === 'available' && listing.status === 'approved';
+  const shouldSurfacePremium =
+    listing.saleStatus === 'available' && listing.status === 'approved';
   listing.isFeatured = shouldSurfacePremium;
   listing.isVerified = shouldSurfacePremium;
 }
@@ -106,13 +120,18 @@ async function cleanupDeletedListing(listingId) {
   ]);
 }
 
+/* ─── Routes ──────────────────────────────────────────────────────────────── */
+
 router.get('/meta/options', async (_req, res) => {
-  const approved = await Listing.find({ status: 'approved', saleStatus: 'available' }).select('category state');
+  const approved = await Listing.find({
+    status: 'approved',
+    saleStatus: 'available',
+  }).select('category state');
   const categoryCounts = CATEGORIES.map((name) => ({
     name,
     count: approved.filter((item) => item.category === name).length,
   }));
-  const stateCounts = NIGERIAN_STATES.filter((state) => state !== 'All States').map((name) => ({
+  const stateCounts = NIGERIAN_STATES.filter((s) => s !== 'All States').map((name) => ({
     name,
     count: approved.filter((item) => item.state === name).length,
   }));
@@ -130,7 +149,6 @@ router.get('/featured', async (_req, res) => {
     .sort({ featuredUntil: -1, createdAt: -1 })
     .limit(12)
     .populate('user', 'name avatar');
-
   res.json(featured);
 });
 
@@ -139,13 +157,41 @@ router.get('/mine', auth, async (req, res) => {
   res.json(listings);
 });
 
+/* ─── Admin dashboard — enhanced with aggregate counts ───────────────────── */
+
 router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
-  const pendingListings = await Listing.find({ status: 'pending' }).populate('user', 'name email').sort({ createdAt: -1 });
-  const reports = await Report.find({ status: 'open' }).populate('listing').sort({ createdAt: -1 });
-  const unreadNotifications = await Notification.countDocuments({ isRead: false });
-  const pendingCount = await Listing.countDocuments({ status: 'pending' });
-  const inboxCount = await Message.countDocuments();
-  res.json({ pendingListings, reports, unreadNotifications, pendingCount, inboxCount });
+  const [
+    pendingListings,
+    reports,
+    unreadNotifications,
+    pendingCount,
+    totalListings,
+    totalUsers,
+    premiumUsers,
+    inboxCount,
+  ] = await Promise.all([
+    Listing.find({ status: 'pending' })
+      .populate('user', 'name email')
+      .sort({ createdAt: -1 }),
+    Report.find({ status: 'open' }).populate('listing').sort({ createdAt: -1 }),
+    Notification.countDocuments({ isRead: false }),
+    Listing.countDocuments({ status: 'pending' }),
+    Listing.countDocuments(),
+    User.countDocuments(),
+    User.countDocuments({ premiumStatus: 'active' }),
+    Message.countDocuments(),
+  ]);
+
+  res.json({
+    pendingListings,
+    reports,
+    unreadNotifications,
+    pendingCount,
+    totalListings,
+    totalUsers,
+    premiumUsers,
+    inboxCount,
+  });
 });
 
 router.get('/', async (req, res) => {
@@ -163,7 +209,6 @@ router.get('/', async (req, res) => {
   if (saleStatus && saleStatus !== 'All') query.saleStatus = saleStatus;
   if (state && state !== 'All States') query.state = state;
   if (category && category !== 'All Categories') query.category = category;
-
   if (search) {
     query.$or = [
       { title: { $regex: search, $options: 'i' } },
@@ -175,46 +220,38 @@ router.get('/', async (req, res) => {
   const listings = await Listing.find(query)
     .populate('user', 'name avatar')
     .sort(getPublicSort(sort));
-
   res.json(listings);
 });
 
 router.get('/:id', async (req, res) => {
-  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar premiumStatus premiumExpiresAt');
+  const listing = await Listing.findById(req.params.id).populate(
+    'user',
+    'name email avatar premiumStatus premiumExpiresAt',
+  );
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
   res.json(listing);
 });
 
 router.post('/', auth, upload.array('photos', 4), async (req, res) => {
   const {
-    title,
-    category,
-    description,
-    state,
-    city,
-    locationLabel,
-    startingPrice,
-    priceLabel,
-    whatsapp,
-    email,
-    phone,
-    safetyAccepted,
+    title, category, description, state, city, locationLabel,
+    startingPrice, priceLabel, whatsapp, email, phone, safetyAccepted,
   } = req.body;
 
-  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
+  if (!title || !category || !description || !state || !city ||
+    startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
     return res.status(400).json({ message: 'All required fields must be filled' });
   }
-
   if (!isValidCategory(category)) {
     return res.status(400).json({ message: 'Please choose a valid category.' });
   }
-
   if (String(safetyAccepted) !== 'true') {
     return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
   }
 
   const photos = toBase64Photos(req.files || []);
-  if (!photos.length) return res.status(400).json({ message: 'At least one photo is required' });
+  if (!photos.length)
+    return res.status(400).json({ message: 'At least one photo is required' });
 
   const scamHit = detectScamText(`${title} ${description}`);
   const moderationStatus = scamHit ? 'rejected' : 'pending';
@@ -222,11 +259,7 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
 
   const listing = await Listing.create({
     user: req.user._id,
-    title,
-    category,
-    description,
-    state,
-    city,
+    title, category, description, state, city,
     locationLabel,
     startingPrice: Number(startingPrice),
     priceLabel,
@@ -262,40 +295,28 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
 
 router.patch('/:id', auth, upload.array('photos', 4), async (req, res) => {
   const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
-  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+  if (!listing)
+    return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
 
   const {
-    title,
-    category,
-    description,
-    state,
-    city,
-    locationLabel,
-    startingPrice,
-    priceLabel,
-    whatsapp,
-    email,
-    phone,
-    keepPhotos,
-    safetyAccepted,
+    title, category, description, state, city, locationLabel,
+    startingPrice, priceLabel, whatsapp, email, phone, keepPhotos, safetyAccepted,
   } = req.body;
 
   const preservedPhotos = parsePhotosField(keepPhotos);
   const uploadedPhotos = toBase64Photos(req.files || []);
   const nextPhotos = [...preservedPhotos, ...uploadedPhotos].slice(0, 4);
 
-  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
+  if (!title || !category || !description || !state || !city ||
+    startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
     return res.status(400).json({ message: 'All required fields must be filled' });
   }
-
   if (!isValidCategory(category)) {
     return res.status(400).json({ message: 'Please choose a valid category.' });
   }
-
   if (String(safetyAccepted) !== 'true') {
     return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
   }
-
   if (!nextPhotos.length) {
     return res.status(400).json({ message: 'Keep at least one photo or upload a new one.' });
   }
@@ -329,22 +350,20 @@ router.patch('/:id', auth, upload.array('photos', 4), async (req, res) => {
 router.patch('/:id/sale-status', auth, async (req, res) => {
   const { saleStatus } = req.body;
   const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
-  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
-
+  if (!listing)
+    return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
   if (!['available', 'sold'].includes(saleStatus)) {
     return res.status(400).json({ message: 'Invalid sale status supplied.' });
   }
-
   applySaleStatusEffects(listing, saleStatus, req.user);
   await listing.save();
-
   res.json(listing);
 });
 
 router.delete('/:id', auth, async (req, res) => {
   const listing = await Listing.findOneAndDelete({ _id: req.params.id, user: req.user._id });
-  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
-
+  if (!listing)
+    return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
   await cleanupDeletedListing(listing._id);
   res.json({ message: 'Listing deleted successfully.' });
 });
@@ -380,17 +399,18 @@ router.patch('/:id/status', auth, adminOnly, async (req, res) => {
 
 router.post('/:id/reviews', auth, async (req, res) => {
   const { rating, comment } = req.body;
-  if (!rating || !comment) return res.status(400).json({ message: 'Rating and comment are required' });
+  if (!rating || !comment)
+    return res.status(400).json({ message: 'Rating and comment are required' });
   const listing = await Listing.findById(req.params.id);
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
-
   if (listing.user.toString() === req.user._id.toString()) {
     return res.status(400).json({ message: 'You cannot review or rate your own listing.' });
   }
-
-  const existing = listing.reviews.find((review) => review.user?.toString() === req.user._id.toString());
-  if (existing) return res.status(400).json({ message: 'You already reviewed this listing' });
-
+  const existing = listing.reviews.find(
+    (r) => r.user?.toString() === req.user._id.toString(),
+  );
+  if (existing)
+    return res.status(400).json({ message: 'You already reviewed this listing' });
   listing.reviews.push({
     user: req.user._id,
     name: req.user.name,
@@ -399,16 +419,15 @@ router.post('/:id/reviews', auth, async (req, res) => {
   });
   updateRatingStats(listing);
   await listing.save();
-
   res.status(201).json(listing);
 });
 
 router.post('/:id/report', optionalAuth, async (req, res) => {
   const { reporterName, reporterEmail, reason } = req.body;
-  if (!reporterName || !reason) return res.status(400).json({ message: 'Reporter name and reason are required' });
+  if (!reporterName || !reason)
+    return res.status(400).json({ message: 'Reporter name and reason are required' });
   const listing = await Listing.findById(req.params.id);
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
-
   if (req.user && listing.user.toString() === req.user._id.toString()) {
     return res.status(400).json({ message: 'You cannot report your own listing.' });
   }
@@ -427,12 +446,7 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
     meta: { listingId: listing._id.toString(), reportId: report._id.toString() },
   });
 
-  await sendAdminListingReportedEmail({
-    listing,
-    reporterName,
-    reporterEmail,
-    reason,
-  });
+  await sendAdminListingReportedEmail({ listing, reporterName, reporterEmail, reason });
 
   res.status(201).json({ message: 'Report sent to admin successfully' });
 });

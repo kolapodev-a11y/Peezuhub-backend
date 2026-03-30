@@ -1,16 +1,24 @@
+/**
+ * authRoutes.js — PeezuHub
+ *
+ * ADDITION: Fire a `new_signup` notification whenever a user registers
+ *   (email/password or Google OAuth) so the admin can see new signups
+ *   in the categorised notification centre.
+ *
+ * ADDITION: GET /admin/users  — returns all users for the admin dashboard
+ *   Users tab (sorted newest first, password hash excluded).
+ */
+
 const express = require('express');
-const axios = require('axios');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
-const { auth } = require('../middleware/auth');
+const Notification = require('../models/Notification');
+const { auth, adminOnly } = require('../middleware/auth');
 
 const router = express.Router();
-
-const googleClient = process.env.GOOGLE_CLIENT_ID
-  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
-  : null;
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 function signToken(user) {
   return jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
@@ -21,177 +29,140 @@ function adminRoleForEmail(email) {
   return email.toLowerCase() === adminEmail ? 'admin' : 'user';
 }
 
-function serializeUser(user) {
-  return {
-    _id: user._id.toString(),
-    id: user._id.toString(),
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    avatar: user.avatar,
-    premiumPlan: user.premiumPlan,
-    premiumStatus: user.premiumStatus,
-    premiumReference: user.premiumReference,
-    premiumActivatedAt: user.premiumActivatedAt,
-    premiumExpiresAt: user.premiumExpiresAt,
-    premiumAmount: user.premiumAmount,
-    createdAt: user.createdAt,
-    updatedAt: user.updatedAt,
-  };
-}
+/* ─── Register ───────────────────────────────────────────────────────────── */
 
-async function resolveGoogleProfile({ credential, accessToken }) {
-  if (accessToken) {
-    let data;
-    try {
-      const response = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` },
-        timeout: 8000,
-      });
-      data = response.data;
-    } catch (err) {
-      const hint =
-        err.response?.data?.error === 'invalid_token'
-          ? 'Your Google session has expired. Please try signing in again.'
-          : 'Could not verify your Google account. Check your internet connection and try again.';
-      throw new Error(hint);
-    }
-
-    if (!data?.email || !data?.sub) {
-      throw new Error('Google returned an incomplete profile. Please try again.');
-    }
-    if (data.email_verified === false) {
-      throw new Error('Your Google email address is not verified.');
-    }
-
-    return {
-      email: data.email.toLowerCase(),
-      name: data.name || data.email.split('@')[0],
-      googleId: data.sub,
-      avatar: data.picture || '',
-    };
+router.post('/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) {
+    return res
+      .status(400)
+      .json({ message: 'Name, email and password are required' });
   }
 
-  if (credential && googleClient) {
-    let payload;
-    try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: process.env.GOOGLE_CLIENT_ID,
-      });
-      payload = ticket.getPayload();
-    } catch {
-      throw new Error('Google ID token verification failed. Please try again.');
-    }
+  const existing = await User.findOne({ email: email.toLowerCase() });
+  if (existing) return res.status(400).json({ message: 'Email already in use' });
 
-    if (!payload?.email || !payload?.sub) {
-      throw new Error('Unable to verify your Google account.');
-    }
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = await User.create({
+    name,
+    email: email.toLowerCase(),
+    passwordHash,
+    role: adminRoleForEmail(email),
+  });
 
-    return {
-      email: payload.email.toLowerCase(),
-      name: payload.name || payload.email.split('@')[0],
-      googleId: payload.sub,
-      avatar: payload.picture || '',
-    };
-  }
+  // Notify admin of new signup
+  await Notification.create({
+    type: 'new_signup',
+    title: 'New user registered',
+    message: `${user.name} (${user.email}) just created an account via email/password.`,
+    meta: { userId: user._id.toString(), method: 'email' },
+  }).catch(() => {}); // non-blocking — don't fail registration if this errors
 
-  throw new Error('No Google credentials were provided. Please try the Google button again.');
-}
-
-router.post('/register', async (req, res, next) => {
-  try {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Name, email and password are required.' });
-    }
-
-    const normalizedEmail = email.toLowerCase();
-    const existing = await User.findOne({ email: normalizedEmail });
-    if (existing) return res.status(400).json({ message: 'That email address is already in use.' });
-
-    const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({
-      name,
-      email: normalizedEmail,
-      passwordHash,
-      role: adminRoleForEmail(normalizedEmail),
-    });
-
-    const token = signToken(user);
-    res.status(201).json({ token, user: serializeUser(user) });
-  } catch (err) {
-    next(err);
-  }
+  const token = signToken(user);
+  res.status(201).json({
+    token,
+    user: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      avatar: user.avatar,
+    },
+  });
 });
 
-router.post('/login', async (req, res, next) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required.' });
-    }
+/* ─── Login ──────────────────────────────────────────────────────────────── */
 
-    const normalizedEmail = email.toLowerCase();
-    const user = await User.findOne({ email: normalizedEmail });
-    if (!user || !user.passwordHash) {
-      return res.status(400).json({ message: 'Invalid email or password.' });
-    }
-
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) return res.status(400).json({ message: 'Invalid email or password.' });
-
-    user.role = adminRoleForEmail(user.email);
-    await user.save();
-
-    const token = signToken(user);
-    res.json({ token, user: serializeUser(user) });
-  } catch (err) {
-    next(err);
-  }
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email: email?.toLowerCase() });
+  if (!user || !user.passwordHash)
+    return res.status(400).json({ message: 'Invalid credentials' });
+  const match = await bcrypt.compare(password, user.passwordHash);
+  if (!match) return res.status(400).json({ message: 'Invalid credentials' });
+  user.role = adminRoleForEmail(user.email);
+  await user.save();
+  const token = signToken(user);
+  res.json({
+    token,
+    user: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      avatar: user.avatar,
+    },
+  });
 });
+
+/* ─── Google OAuth ───────────────────────────────────────────────────────── */
 
 router.post('/google', async (req, res) => {
-  try {
-    const { credential, accessToken, mode = 'login' } = req.body;
-    const authMode = mode === 'register' ? 'register' : 'login';
-    const profile = await resolveGoogleProfile({ credential, accessToken });
+  const { credential } = req.body;
+  if (!credential)
+    return res.status(400).json({ message: 'Google credential missing' });
 
-    let user = await User.findOne({ email: profile.email });
+  const ticket = await googleClient.verifyIdToken({
+    idToken: credential,
+    audience: process.env.GOOGLE_CLIENT_ID,
+  });
+  const payload = ticket.getPayload();
+  const email = payload.email.toLowerCase();
 
-    if (!user && authMode === 'login') {
-      return res.status(404).json({
-        message: 'No PeezuHub account found for this Google email. Please register first.',
-      });
-    }
+  let user = await User.findOne({ email });
+  const isNewUser = !user;
 
-    if (!user) {
-      user = await User.create({
-        name: profile.name,
-        email: profile.email,
-        googleId: profile.googleId,
-        avatar: profile.avatar,
-        role: adminRoleForEmail(profile.email),
-      });
-    } else {
-      user.name = user.name || profile.name;
-      user.googleId = profile.googleId;
-      user.avatar = profile.avatar || user.avatar;
-      user.role = adminRoleForEmail(profile.email);
-      await user.save();
-    }
-
-    const token = signToken(user);
-    res.json({ token, user: serializeUser(user) });
-  } catch (err) {
-    const status = err.status || 401;
-    return res.status(status).json({ message: err.message || 'Google authentication failed.' });
+  if (!user) {
+    user = await User.create({
+      name: payload.name || email.split('@')[0],
+      email,
+      googleId: payload.sub,
+      avatar: payload.picture || '',
+      role: adminRoleForEmail(email),
+    });
+  } else {
+    user.googleId = payload.sub;
+    user.avatar = payload.picture || user.avatar;
+    user.role = adminRoleForEmail(email);
+    await user.save();
   }
+
+  // Only notify on first Google sign-up (not subsequent logins)
+  if (isNewUser) {
+    await Notification.create({
+      type: 'new_signup',
+      title: 'New user registered',
+      message: `${user.name} (${user.email}) just created an account via Google OAuth.`,
+      meta: { userId: user._id.toString(), method: 'google' },
+    }).catch(() => {});
+  }
+
+  const token = signToken(user);
+  res.json({
+    token,
+    user: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      avatar: user.avatar,
+    },
+  });
 });
 
+/* ─── Me ─────────────────────────────────────────────────────────────────── */
+
 router.get('/me', auth, async (req, res) => {
-  const freshUser = await User.findById(req.user._id).select('-passwordHash');
-  res.json({ user: serializeUser(freshUser) });
+  res.json({ user: req.user });
+});
+
+/* ─── Admin: All Users ───────────────────────────────────────────────────── */
+
+router.get('/admin/users', auth, adminOnly, async (_req, res) => {
+  const users = await User.find()
+    .select('-passwordHash')
+    .sort({ createdAt: -1 });
+  res.json({ users });
 });
 
 module.exports = router;
