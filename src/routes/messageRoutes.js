@@ -3,7 +3,6 @@ const Message = require('../models/Message');
 const Listing = require('../models/Listing');
 const Notification = require('../models/Notification');
 const { auth, optionalAuth } = require('../middleware/auth');
-const { queueEmail } = require('../utils/sendEmail');
 
 const router = express.Router();
 
@@ -34,15 +33,6 @@ router.post('/contact/:listingId', optionalAuth, async (req, res) => {
     message: `${senderName} contacted ${listing.title}`,
     meta: { listingId: listing._id.toString(), messageId: record._id.toString() },
   });
-
-  if (listing.contact?.email) {
-    queueEmail({
-      to: listing.contact.email,
-      subject: `PeezuHub enquiry for ${listing.title}`,
-      html: `<p><strong>${senderName}</strong> sent an enquiry on PeezuHub.</p><p>${message}</p><p>Email: ${senderEmail || '-'}<br/>Phone: ${senderPhone || '-'}</p>`,
-      replyTo: senderEmail || undefined,
-    });
-  }
 
   res.status(201).json({ message: 'Your enquiry has been sent.' });
 });

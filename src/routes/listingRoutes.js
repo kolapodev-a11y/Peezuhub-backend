@@ -7,13 +7,10 @@ const Message = require('../models/Message');
 const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
 const { detectScamText } = require('../utils/scamCheck');
 const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
-const { queueEmail } = require('../utils/sendEmail');
 const {
-  APP_NAME,
-  buildAdminAlertEmail,
-  formatDateTime,
-  getAdminNotificationRecipients,
-} = require('../utils/emailTemplates');
+  sendAdminListingReportedEmail,
+  sendAdminListingSubmittedEmail,
+} = require('../utils/sendEmail');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
@@ -254,27 +251,10 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     meta: { listingId: listing._id.toString(), status: moderationStatus },
   });
 
-  const newListingEmail = buildAdminAlertEmail({
-    title: 'New listing awaiting approval',
-    intro: `A new listing was submitted on ${APP_NAME} and is ready for moderation.`,
-    fields: [
-      { label: 'Title', value: title },
-      { label: 'Seller', value: req.user.name },
-      { label: 'Seller email', value: req.user.email },
-      { label: 'Location', value: `${city}, ${state}` },
-      { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
-      { label: 'Status', value: moderationStatus },
-      { label: 'Submitted', value: formatDateTime(listing.createdAt) },
-    ],
-    actionLabel: 'Review pending listings',
-    footerNote: 'Submitted listings stay pending until you approve them in the admin dashboard.',
-  });
-
-  queueEmail({
-    to: getAdminNotificationRecipients(),
-    subject: `${APP_NAME} listing submitted: ${title}`,
-    html: newListingEmail.html,
-    text: newListingEmail.text,
+  await sendAdminListingSubmittedEmail({
+    listing,
+    ownerName: req.user.name,
+    ownerEmail: req.user.email,
   });
 
   res.status(201).json({ listing, paymentNeeded: false });
@@ -447,25 +427,11 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
     meta: { listingId: listing._id.toString(), reportId: report._id.toString() },
   });
 
-  const reportEmail = buildAdminAlertEmail({
-    title: 'Listing reported for review',
-    intro: `${reporterName} reported a listing on ${APP_NAME}.`,
-    fields: [
-      { label: 'Listing', value: listing.title },
-      { label: 'Reporter', value: reporterName },
-      { label: 'Reporter email', value: reporterEmail || 'Not provided' },
-      { label: 'Reason', value: reason },
-      { label: 'Reported', value: formatDateTime(report.createdAt) },
-    ],
-    actionLabel: 'Review reports',
-    footerNote: 'This notification goes only to the configured PeezuHub admin inbox.',
-  });
-
-  queueEmail({
-    to: getAdminNotificationRecipients(),
-    subject: `${APP_NAME} report: ${listing.title}`,
-    html: reportEmail.html,
-    text: reportEmail.text,
+  await sendAdminListingReportedEmail({
+    listing,
+    reporterName,
+    reporterEmail,
+    reason,
   });
 
   res.status(201).json({ message: 'Report sent to admin successfully' });
