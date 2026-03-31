@@ -4,9 +4,35 @@
  * -------------------------------------------------
  * Creates a fresh transport per send, avoids stale pooled sockets,
  * and retries once on transient timeout / connection errors.
+ *
+ * Safety improvement:
+ * - Nodemailer is loaded lazily so a missing dependency never crashes boot.
+ * - If SMTP/nodemailer is unavailable, the API keeps running and logs a warning.
  */
 
-const nodemailer = require('nodemailer');
+let nodemailerInstance = null;
+let nodemailerLoadAttempted = false;
+
+function getNodemailer() {
+  if (nodemailerLoadAttempted) {
+    return nodemailerInstance;
+  }
+
+  nodemailerLoadAttempted = true;
+
+  try {
+    // Load lazily so app startup does not crash when the dependency is missing.
+    // The package is still declared in package.json and should be installed normally.
+    // This fallback simply keeps production booting instead of hard-failing.
+    // eslint-disable-next-line global-require
+    nodemailerInstance = require('nodemailer');
+  } catch (error) {
+    nodemailerInstance = null;
+    console.error('[PeezuHub] nodemailer is not installed or could not be loaded:', error.message);
+  }
+
+  return nodemailerInstance;
+}
 
 function normalizeRecipients(value) {
   if (!value) return [];
@@ -114,6 +140,12 @@ function buildTransportConfig() {
 }
 
 function createTransporter() {
+  const nodemailer = getNodemailer();
+  if (!nodemailer) {
+    console.warn('[PeezuHub] Email transport unavailable because nodemailer could not be loaded.');
+    return null;
+  }
+
   const config = buildTransportConfig();
   if (!config) {
     console.warn('[PeezuHub] SMTP not fully configured - emails will be skipped.');
