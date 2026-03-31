@@ -14,6 +14,8 @@ const userSchema = new mongoose.Schema(
     premiumActivatedAt: { type: Date, default: null },
     premiumExpiresAt: { type: Date, default: null },
     premiumAmount: { type: Number, default: 0 },
+    processedPremiumReference: { type: String, default: '' },
+    premiumReceiptSentAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
