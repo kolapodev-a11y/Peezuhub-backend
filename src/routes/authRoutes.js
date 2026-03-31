@@ -11,10 +11,8 @@ const { auth, adminOnly } = require('../middleware/auth');
 
 const router = express.Router();
 const APP_NAME = process.env.APP_NAME || 'PeezuHub';
-
-const googleClient = process.env.GOOGLE_CLIENT_ID
-  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
-  : null;
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 function signToken(user) {
   return jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
@@ -51,36 +49,63 @@ function serializeUser(user) {
   };
 }
 
+function cleanString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    const normalized = cleanString(value);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isLikelyJwt(token = '') {
+  return typeof token === 'string' && token.split('.').length === 3;
+}
+
 function normalizeGooglePayload(body = {}) {
-  const nestedCredential =
-    body.credential && typeof body.credential === 'object' && !Array.isArray(body.credential)
-      ? body.credential
-      : null;
+  const root = isPlainObject(body) ? body : {};
+  const nestedCredential = isPlainObject(root.credential) ? root.credential : {};
+  const tokenResponse = isPlainObject(root.tokenResponse) ? root.tokenResponse : {};
+  const google = isPlainObject(root.google) ? root.google : {};
 
-  const credential =
-    typeof body.credential === 'string'
-      ? body.credential.trim()
-      : typeof nestedCredential?.credential === 'string'
-      ? nestedCredential.credential.trim()
-      : '';
+  const credential = firstNonEmptyString(
+    root.credential,
+    root.idToken,
+    root.id_token,
+    nestedCredential.credential,
+    nestedCredential.idToken,
+    nestedCredential.id_token,
+    tokenResponse.credential,
+    tokenResponse.idToken,
+    tokenResponse.id_token,
+    google.credential,
+    google.idToken,
+    google.id_token,
+  );
 
-  const accessToken =
-    typeof body.accessToken === 'string'
-      ? body.accessToken.trim()
-      : typeof body.access_token === 'string'
-      ? body.access_token.trim()
-      : typeof nestedCredential?.accessToken === 'string'
-      ? nestedCredential.accessToken.trim()
-      : typeof nestedCredential?.access_token === 'string'
-      ? nestedCredential.access_token.trim()
-      : '';
+  const accessToken = firstNonEmptyString(
+    root.accessToken,
+    root.access_token,
+    root.token,
+    nestedCredential.accessToken,
+    nestedCredential.access_token,
+    tokenResponse.accessToken,
+    tokenResponse.access_token,
+    tokenResponse.token,
+    google.accessToken,
+    google.access_token,
+    google.token,
+  );
 
-  const mode =
-    typeof body.mode === 'string'
-      ? body.mode.trim()
-      : typeof nestedCredential?.mode === 'string'
-      ? nestedCredential.mode.trim()
-      : 'login';
+  const modeCandidate = firstNonEmptyString(root.mode, nestedCredential.mode, tokenResponse.mode, google.mode);
+  const mode = modeCandidate === 'register' ? 'register' : 'login';
 
   return { credential, accessToken, mode };
 }
@@ -103,11 +128,14 @@ async function createSignupNotification(user, method) {
 }
 
 async function resolveGoogleProfile({ credential, accessToken }) {
-  if (typeof accessToken === 'string' && accessToken.trim()) {
+  const safeAccessToken = cleanString(accessToken);
+  const safeCredential = cleanString(credential);
+
+  if (safeAccessToken) {
     let data;
     try {
       const response = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` },
+        headers: { Authorization: `Bearer ${safeAccessToken}` },
         timeout: 8000,
       });
       data = response.data;
@@ -134,20 +162,31 @@ async function resolveGoogleProfile({ credential, accessToken }) {
     };
   }
 
-  if (typeof credential === 'string' && credential.trim() && googleClient) {
+  if (safeCredential) {
+    if (!isLikelyJwt(safeCredential)) {
+      throw new Error('Google credential format is invalid. Please sign in again.');
+    }
+
+    if (!googleClient || !GOOGLE_CLIENT_ID) {
+      throw new Error('Google sign-in is not configured on the server. Set GOOGLE_CLIENT_ID in Render.');
+    }
+
     let payload;
     try {
       const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: process.env.GOOGLE_CLIENT_ID,
+        idToken: safeCredential,
+        audience: GOOGLE_CLIENT_ID,
       });
       payload = ticket.getPayload();
-    } catch {
+    } catch (error) {
       throw new Error('Google ID token verification failed. Please try again.');
     }
 
     if (!payload?.email || !payload?.sub) {
       throw new Error('Unable to verify your Google account.');
+    }
+    if (payload.email_verified === false) {
+      throw new Error('Your Google email address is not verified.');
     }
 
     return {
