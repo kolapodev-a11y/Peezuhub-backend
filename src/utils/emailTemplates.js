@@ -98,11 +98,11 @@ function wrapLayout(bodyHtml, previewText = '') {
     .header p  { margin:6px 0 0; font-size:14px; color:rgba(255,255,255,0.85); }
     .body    { padding:32px 40px; }
     .body p  { margin:0 0 16px; font-size:15px; line-height:1.6; color:${BRAND_TEXT}; }
-    .fields  { width:100%; border-collapse:collapse; margin:20px 0; }
-    .fields td { padding:10px 14px; font-size:14px; border-bottom:1px solid ${BORDER_COLOR}; }
+    .fields  { width:100%; border-collapse:collapse; margin:20px 0; table-layout:fixed; }
+    .fields td { padding:10px 14px; font-size:14px; border-bottom:1px solid ${BORDER_COLOR}; vertical-align:top; }
     .fields tr:last-child td { border-bottom:none; }
-    .fields .label { color:${MUTED_TEXT}; font-weight:600; width:40%; }
-    .fields .value { color:${BRAND_TEXT}; word-break:break-all; }
+    .fields .label { color:${MUTED_TEXT}; font-weight:600; width:34%; }
+    .fields .value { color:${BRAND_TEXT}; word-break:break-word; overflow-wrap:anywhere; white-space:normal; }
     .fields tr:nth-child(even) td { background:${BRAND_LIGHT_BG}; }
     .btn-wrap { text-align:center; margin:28px 0 8px; }
     .btn  { display:inline-block; padding:13px 32px; background:${BRAND_PRIMARY};
@@ -256,11 +256,17 @@ function buildPremiumConfirmEmail({ userName, userEmail, reference, amountNaira,
 
     <table class="fields"><tbody>
       <tr><td class="label">Reference</td><td class="value">${escHtml(reference)}</td></tr>
+      <tr><td class="label">Account email</td><td class="value">${escHtml(userEmail)}</td></tr>
       <tr><td class="label">Amount paid</td><td class="value">₦${Number(amountNaira).toLocaleString('en-NG')}</td></tr>
       <tr><td class="label">Plan</td><td class="value">Seller Premium – All listings</td></tr>
       <tr><td class="label">Activated</td><td class="value">${escHtml(activatedStr)}</td></tr>
       <tr><td class="label">Expires</td><td class="value">${escHtml(expiryStr)}</td></tr>
     </tbody></table>
+
+    <div style="margin:16px 0 20px;padding:14px 16px;border:1px solid ${BORDER_COLOR};border-radius:12px;background:#fff;word-break:break-word;overflow-wrap:anywhere;">
+      <p style="margin:0 0 6px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:${MUTED_TEXT};">Premium account email</p>
+      <p style="margin:0;font-size:15px;line-height:1.7;color:${BRAND_TEXT};word-break:break-word;overflow-wrap:anywhere;">${escHtml(userEmail)}</p>
+    </div>
 
     <p style="background:${BRAND_LIGHT_BG};border-left:4px solid ${BRAND_PRIMARY};
               padding:14px 16px;border-radius:0 8px 8px 0;font-size:14px;color:${BRAND_TEXT};">
@@ -287,6 +293,7 @@ function buildPremiumConfirmEmail({ userName, userEmail, reference, amountNaira,
     'Your Seller Premium plan is now ACTIVE.',
     '',
     `Reference : ${reference}`,
+    `Email     : ${userEmail}`,
     `Amount    : ₦${Number(amountNaira).toLocaleString('en-NG')}`,
     `Plan      : Seller Premium (all listings)`,
     `Activated : ${activatedStr}`,
