@@ -1,5 +1,4 @@
-// FIX #1 – CORS: accept both the exact CLIENT_URL *and* any *.vercel.app
-//           preview deployments so Google OAuth callbacks never hit a CORS wall.
+'use strict';
 
 require('dotenv').config();
 const express = require('express');
@@ -14,33 +13,41 @@ const messageRoutes = require('./src/routes/messageRoutes');
 const app = express();
 connectDB();
 
-// Build the allowed-origin list from CLIENT_URL (comma-separated in Railway).
-// Also allow localhost:5173 for local dev.
-const explicitOrigins = (process.env.CLIENT_URL || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+function parseEnvOrigins(raw = '') {
+  return String(raw)
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
-const allowedOrigins = new Set([
+const explicitOrigins = new Set([
   'http://localhost:5173',
   'http://localhost:3000',
-  ...explicitOrigins,
+  ...parseEnvOrigins(process.env.CLIENT_URL),
+  ...parseEnvOrigins(process.env.ADMIN_DASHBOARD_URL),
 ]);
+
+const dynamicOriginMatchers = [
+  /^https:\/\/peezu-hub[\w-]*\.vercel\.app$/i,
+  /^https:\/\/([a-z0-9-]+\.)?peezuhub\.name\.ng$/i,
+  /^https:\/\/([a-z0-9-]+\.)?peezuhub\.name\.ng$/i,
+];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow requests with no origin (e.g. server-to-server, Postman)
       if (!origin) return callback(null, true);
 
-      if (allowedOrigins.has(origin)) return callback(null, true);
-
-      // Allow any Vercel preview deployment for this project
-      if (/^https:\/\/peezu-hub[\w-]*\.vercel\.app$/.test(origin)) {
+      if (explicitOrigins.has(origin)) {
         return callback(null, true);
       }
 
-      callback(new Error(`CORS: origin '${origin}' is not allowed`));
+      const allowedByPattern = dynamicOriginMatchers.some((matcher) => matcher.test(origin));
+      if (allowedByPattern) {
+        return callback(null, true);
+      }
+
+      return callback(new Error(`CORS: origin '${origin}' is not allowed`));
     },
     credentials: true,
   }),
@@ -59,7 +66,6 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/messages', messageRoutes);
 
-// Global error handler
 app.use((err, _req, res, _next) => {
   console.error('[PeezuHub Error]', err.message);
   res.status(err.status || 500).json({ message: err.message || 'Server error' });
