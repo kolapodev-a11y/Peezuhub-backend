@@ -1,10 +1,8 @@
 'use strict';
 /**
- * PeezuHub – Email Templates & Helpers
+ * PeezuHub – responsive email templates
  * ------------------------------------
- * Dedicated PeezuHub mail branding is intentionally isolated from payment keys
- * so sharing Paystack test keys with another project cannot accidentally change
- * the branding of these emails.
+ * Keeps the existing dark admin-alert look while hardening the markup for Gmail/mobile.
  */
 
 function firstEnv(...keys) {
@@ -21,13 +19,30 @@ const CLIENT_URL =
   (process.env.CLIENT_URL || '').split(',')[0].trim() ||
   'https://peezu-hub-new.vercel.app';
 
-const BRAND_PRIMARY = '#7C3AED';
-const BRAND_DARK = '#5B21B6';
-const BRAND_LIGHT_BG = '#F5F3FF';
-const BRAND_TEXT = '#1E1B4B';
-const MUTED_TEXT = '#6B7280';
-const BORDER_COLOR = '#E5E7EB';
-const SUCCESS_GREEN = '#16A34A';
+const FALLBACK_SUPPORT_EMAIL = 'peezutech@gmail.com';
+const PANEL_BG = '#11161F';
+const PANEL_BORDER = '#2A3241';
+const CARD_BG = '#161D27';
+const BODY_TEXT = '#E5E7EB';
+const MUTED_TEXT = '#AEB8C8';
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function stripHtml(html = '') {
+  return String(html)
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function formatDateTime(date) {
   const d = date instanceof Date ? date : new Date(date);
@@ -49,7 +64,7 @@ function getAdminNotificationRecipients() {
     firstEnv('MAIL_ADMIN_EMAILS') ||
     firstEnv('ADMIN_EMAIL') ||
     firstEnv('MAIL_ADMIN_EMAIL') ||
-    'peezutech@gmail.com';
+    FALLBACK_SUPPORT_EMAIL;
 
   return raw
     .split(',')
@@ -62,7 +77,7 @@ function getSupportEmail() {
   return (
     firstEnv('SUPPORT_EMAIL', 'MAIL_SUPPORT_EMAIL', 'ADMIN_EMAIL', 'MAIL_ADMIN_EMAIL') ||
     getAdminNotificationRecipients().split(',')[0] ||
-    'peezutech@gmail.com'
+    FALLBACK_SUPPORT_EMAIL
   );
 }
 
@@ -74,98 +89,210 @@ function getAdminDashboardUrl() {
   return firstEnv('ADMIN_DASHBOARD_URL', 'MAIL_ADMIN_DASHBOARD_URL') || `${CLIENT_URL.replace(/\/$/, '')}/admin`;
 }
 
-function wrapLayout(bodyHtml, previewText = '') {
+function fieldsToText(fields = []) {
+  return fields
+    .filter((item) => item && item.label && item.value !== undefined && item.value !== null && item.value !== '')
+    .map(({ label, value }) => `${label}: ${value}`)
+    .join('\n');
+}
+
+function getAlertTheme(variant = 'listing_approval') {
+  const themes = {
+    listing_approval: {
+      heroBg: '#2563EB',
+      badgeBg: '#3B82F6',
+      buttonBg: '#2563EB',
+      buttonText: '#FFFFFF',
+      accent: '#60A5FA',
+      calloutBg: '#1C2533',
+      calloutBorder: '#3B82F6',
+      eyebrow: 'New listing submitted',
+      buttonLabel: 'Open admin dashboard',
+    },
+    premium_upgrade: {
+      heroBg: '#7C3AED',
+      badgeBg: '#8B5CF6',
+      buttonBg: '#7C3AED',
+      buttonText: '#FFFFFF',
+      accent: '#C4B5FD',
+      calloutBg: '#1C2533',
+      calloutBorder: '#A855F7',
+      eyebrow: 'Premium upgrade paid',
+      buttonLabel: 'Open admin dashboard',
+    },
+    listing_report: {
+      heroBg: '#DC2626',
+      badgeBg: '#EF4444',
+      buttonBg: '#DC2626',
+      buttonText: '#FFFFFF',
+      accent: '#FCA5A5',
+      calloutBg: '#1C2533',
+      calloutBorder: '#EF4444',
+      eyebrow: 'Listing reported',
+      buttonLabel: 'Review admin dashboard',
+    },
+    default: {
+      heroBg: '#2563EB',
+      badgeBg: '#3B82F6',
+      buttonBg: '#2563EB',
+      buttonText: '#FFFFFF',
+      accent: '#BFDBFE',
+      calloutBg: '#1C2533',
+      calloutBorder: '#3B82F6',
+      eyebrow: 'Admin alert',
+      buttonLabel: 'Open admin dashboard',
+    },
+  };
+
+  return themes[variant] || themes.default;
+}
+
+function buildFieldRows(fields = []) {
+  const filteredFields = fields.filter(
+    (field) => field?.label && field?.value !== undefined && field?.value !== null && field?.value !== ''
+  );
+
+  return filteredFields
+    .map(
+      ({ label, value }, index) => `
+        <tr>
+          <td class="field-label" style="padding:12px 14px;width:34%;vertical-align:top;color:${MUTED_TEXT};font-size:14px;font-weight:600;border-bottom:${index === filteredFields.length - 1 ? '0' : `1px solid ${PANEL_BORDER}`};">
+            ${escHtml(label)}
+          </td>
+          <td class="field-value" style="padding:12px 14px;vertical-align:top;color:#F8FAFC;font-size:15px;line-height:1.6;border-bottom:${index === filteredFields.length - 1 ? '0' : `1px solid ${PANEL_BORDER}`};">
+            <span style="display:block;max-width:100%;word-break:break-word;overflow-wrap:anywhere;white-space:normal;hyphens:auto;">
+              ${escHtml(String(value))}
+            </span>
+          </td>
+        </tr>`
+    )
+    .join('');
+}
+
+function wrapLayout({ previewText, contentHtml }) {
   return `<!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>${APP_NAME}</title>
-  <!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
-  <style>
-    body { margin:0; padding:0; background:#F9FAFB; font-family:'Segoe UI',Arial,sans-serif; }
-    table { border-spacing:0; }
-    td { padding:0; }
-    img { border:0; display:block; }
-    a { color:${BRAND_PRIMARY}; text-decoration:none; }
-    .wrapper { width:100%; background:#F9FAFB; padding:40px 16px; }
-    .card { max-width:600px; margin:0 auto; background:#ffffff; border-radius:12px; overflow:hidden; border:1px solid ${BORDER_COLOR}; }
-    .header { background:${BRAND_PRIMARY}; padding:32px 40px; text-align:center; }
-    .header h1 { margin:0; font-size:26px; font-weight:700; color:#ffffff; letter-spacing:-0.5px; }
-    .header p { margin:6px 0 0; font-size:14px; color:rgba(255,255,255,0.85); }
-    .body { padding:32px 40px; }
-    .body p { margin:0 0 16px; font-size:15px; line-height:1.6; color:${BRAND_TEXT}; }
-    .fields { width:100%; border-collapse:collapse; margin:20px 0; table-layout:fixed; }
-    .fields td { padding:10px 14px; font-size:14px; border-bottom:1px solid ${BORDER_COLOR}; vertical-align:top; }
-    .fields tr:last-child td { border-bottom:none; }
-    .fields .label { color:${MUTED_TEXT}; font-weight:600; width:34%; }
-    .fields .value { color:${BRAND_TEXT}; word-break:break-word; overflow-wrap:anywhere; white-space:normal; }
-    .fields tr:nth-child(even) td { background:${BRAND_LIGHT_BG}; }
-    .btn-wrap { text-align:center; margin:28px 0 8px; }
-    .btn { display:inline-block; padding:13px 32px; background:${BRAND_PRIMARY}; color:#ffffff !important; font-size:15px; font-weight:600; border-radius:8px; text-decoration:none; }
-    .btn:hover { background:${BRAND_DARK}; }
-    .badge { display:inline-block; padding:4px 12px; border-radius:20px; font-size:13px; font-weight:600; }
-    .badge-success { background:#DCFCE7; color:${SUCCESS_GREEN}; }
-    .footer { background:#F3F4F6; padding:20px 40px; text-align:center; border-top:1px solid ${BORDER_COLOR}; }
-    .footer p { margin:0 0 6px; font-size:12px; color:${MUTED_TEXT}; }
-    .footer a { color:${BRAND_PRIMARY}; }
-    @media (max-width:600px) {
-      .body { padding:24px 20px; }
-      .header { padding:24px 20px; }
-      .footer { padding:16px 20px; }
-      .fields .label { width:35%; }
-    }
-  </style>
-</head>
-<body>
-${previewText ? `<div style="display:none;max-height:0;overflow:hidden;color:#F9FAFB;font-size:1px;">${previewText}&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;</div>` : ''}
-<div class="wrapper">
-  <table width="100%"><tr><td>
-    <div class="card">
-      <div class="header">
-        <h1>🏠 ${APP_NAME}</h1>
-        <p>Nigeria's Trusted Marketplace</p>
-      </div>
-      <div class="body">
-        ${bodyHtml}
-      </div>
-      <div class="footer">
-        <p>Need help? <a href="mailto:${getSupportEmail()}">Contact support</a></p>
-        <p>&copy; ${new Date().getFullYear()} ${APP_NAME}. All rights reserved.</p>
-        <p><a href="${CLIENT_URL}">${CLIENT_URL}</a></p>
-      </div>
-    </div>
-  </td></tr></table>
-</div>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <title>${escHtml(APP_NAME)}</title>
+    <style>
+      body { margin:0; padding:0; background:#0A0F18; }
+      table { border-spacing:0; border-collapse:collapse; }
+      img { border:0; display:block; }
+      a { text-decoration:none; }
+      .outer { width:100%; background:#0A0F18; }
+      .shell { width:100%; max-width:620px; }
+      .fluid { width:100% !important; }
+      .stack { display:block !important; width:100% !important; }
+      .mobile-pad { padding-left:20px !important; padding-right:20px !important; }
+      @media only screen and (max-width: 620px) {
+        .shell { width:100% !important; }
+        .mobile-pad { padding-left:18px !important; padding-right:18px !important; }
+        .hero-title { font-size:28px !important; line-height:1.2 !important; }
+        .body-copy { font-size:15px !important; }
+        .field-label,
+        .field-value { display:block !important; width:100% !important; }
+        .button-full { display:block !important; width:100% !important; text-align:center !important; }
+      }
+    </style>
+  </head>
+  <body style="margin:0;padding:0;background:#0A0F18;">
+    ${previewText ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${escHtml(previewText)}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>` : ''}
+    <table role="presentation" class="outer" width="100%" style="width:100%;background:#0A0F18;">
+      <tr>
+        <td align="center" style="padding:24px 12px;">
+          ${contentHtml}
+        </td>
+      </tr>
+    </table>
+  </body>
 </html>`;
 }
 
-function fieldsToText(fields = []) {
-  return fields.map(({ label, value }) => `${label}: ${value}`).join('\n');
-}
-
-function buildAdminAlertEmail({ title, intro, fields = [], actionLabel, actionUrl, footerNote }) {
+function buildAdminAlertEmail({
+  variant = 'listing_approval',
+  eyebrow,
+  title,
+  intro,
+  fields = [],
+  actionLabel,
+  actionUrl,
+  footerNote,
+  callout,
+}) {
+  const theme = getAlertTheme(variant);
   const adminUrl = actionUrl || getAdminDashboardUrl();
+  const fieldRows = buildFieldRows(fields);
+  const resolvedEyebrow = eyebrow || theme.eyebrow;
+  const resolvedActionLabel = actionLabel || theme.buttonLabel;
+  const supportEmail = getSupportEmail();
 
-  const fieldRows = fields
-    .map(
-      ({ label, value }) =>
-        `<tr><td class="label">${escHtml(label)}</td><td class="value">${escHtml(String(value))}</td></tr>`
-    )
-    .join('');
+  const contentHtml = `
+  <table role="presentation" class="shell" width="620" style="width:100%;max-width:620px;">
+    <tr>
+      <td style="background:${PANEL_BG};border:1px solid ${PANEL_BORDER};border-radius:24px;padding:0;overflow:hidden;box-shadow:0 24px 56px rgba(0,0,0,0.35);">
+        <table role="presentation" width="100%" style="width:100%;">
+          <tr>
+            <td class="mobile-pad" style="padding:22px 26px;background:${theme.heroBg};">
+              <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.4;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#F8FAFC;">
+                PEEZUHUB ADMIN ALERT
+              </div>
+              <div style="margin-top:12px;display:inline-block;background:${theme.badgeBg};border-radius:999px;padding:7px 14px;font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;line-height:1.2;color:#FFFFFF;">
+                ${escHtml(resolvedEyebrow)}
+              </div>
+              <div class="hero-title" style="margin-top:18px;font-family:Arial,Helvetica,sans-serif;font-size:30px;line-height:1.18;font-weight:800;color:#FFFFFF;letter-spacing:-0.02em;max-width:460px;">
+                ${escHtml(title)}
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td class="mobile-pad" style="padding:28px 26px 30px;background:${PANEL_BG};font-family:Arial,Helvetica,sans-serif;color:${BODY_TEXT};">
+              <div class="body-copy" style="font-size:15px;line-height:1.8;color:${BODY_TEXT};">
+                ${escHtml(intro)}
+              </div>
 
-  const bodyHtml = `
-    <p style="font-size:20px;font-weight:700;margin:0 0 12px;color:${BRAND_TEXT};">${escHtml(title)}</p>
-    <p>${escHtml(intro)}</p>
-    ${fieldRows.length ? `<table class="fields"><tbody>${fieldRows}</tbody></table>` : ''}
-    ${actionLabel ? `<div class="btn-wrap"><a class="btn" href="${escHtml(adminUrl)}">${escHtml(actionLabel)} →</a></div>` : ''}
-    ${footerNote ? `<p style="font-size:13px;color:${MUTED_TEXT};margin-top:24px;border-top:1px solid ${BORDER_COLOR};padding-top:16px;">${escHtml(footerNote)}</p>` : ''}
-  `;
+              ${fieldRows ? `
+              <table role="presentation" width="100%" style="width:100%;margin-top:22px;background:${CARD_BG};border:1px solid ${PANEL_BORDER};border-radius:20px;overflow:hidden;">
+                <tbody>${fieldRows}</tbody>
+              </table>` : ''}
 
-  const previewText = `${title} – ${intro}`;
+              ${callout ? `
+              <table role="presentation" width="100%" style="width:100%;margin-top:20px;background:${theme.calloutBg};border:1px solid ${PANEL_BORDER};border-left:4px solid ${theme.calloutBorder};border-radius:16px;">
+                <tr>
+                  <td style="padding:16px 18px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.8;color:#E2E8F0;word-break:break-word;overflow-wrap:anywhere;">
+                    ${escHtml(callout)}
+                  </td>
+                </tr>
+              </table>` : ''}
+
+              ${resolvedActionLabel ? `
+              <div style="margin-top:24px;">
+                <a href="${escHtml(adminUrl)}" class="button-full" style="display:inline-block;background:${theme.buttonBg};color:${theme.buttonText};padding:14px 24px;border-radius:14px;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:800;line-height:1.2;">
+                  ${escHtml(resolvedActionLabel)}
+                </a>
+              </div>` : ''}
+
+              ${footerNote ? `
+              <div style="margin-top:24px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.9;color:${MUTED_TEXT};word-break:break-word;overflow-wrap:anywhere;">
+                ${escHtml(footerNote)}
+              </div>` : ''}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:14px 16px 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.8;color:${MUTED_TEXT};text-align:center;word-break:break-word;overflow-wrap:anywhere;">
+        Need help? <a href="mailto:${escHtml(supportEmail)}" style="color:${theme.accent};">${escHtml(supportEmail)}</a><br />
+        &copy; ${new Date().getFullYear()} ${escHtml(APP_NAME)}. All rights reserved.
+      </td>
+    </tr>
+  </table>`;
+
   const plainText = [
-    `${APP_NAME} Admin Notification`,
+    `${APP_NAME} Admin Alert`,
     '='.repeat(40),
     title,
     '',
@@ -173,63 +300,86 @@ function buildAdminAlertEmail({ title, intro, fields = [], actionLabel, actionUr
     '',
     fieldsToText(fields),
     '',
-    actionLabel ? `${actionLabel}: ${adminUrl}` : '',
-    footerNote ? `\n${footerNote}` : '',
+    callout || '',
+    '',
+    resolvedActionLabel ? `${resolvedActionLabel}: ${adminUrl}` : '',
+    footerNote || '',
   ]
     .join('\n')
     .trim();
 
-  return { html: wrapLayout(bodyHtml, previewText), text: plainText };
+  return {
+    html: wrapLayout({ previewText: `${title} – ${intro}`, contentHtml }),
+    text: plainText,
+  };
 }
 
 function buildPremiumConfirmEmail({ userName, userEmail, reference, amountNaira, activatedAt, expiresAt }) {
   const expiryStr = formatDateTime(expiresAt);
   const activatedStr = formatDateTime(activatedAt);
   const dashboardUrl = getProfileUrl();
+  const supportEmail = getSupportEmail();
 
-  const bodyHtml = `
-    <div style="text-align:center;margin-bottom:24px;">
-      <span style="font-size:52px;">⭐</span>
-      <p style="font-size:22px;font-weight:700;color:${BRAND_TEXT};margin:8px 0 4px;">Premium Activated!</p>
-      <p style="font-size:15px;color:${MUTED_TEXT};margin:0;">Welcome to <strong>${APP_NAME} Seller Premium</strong></p>
-    </div>
+  const contentHtml = `
+  <table role="presentation" class="shell" width="620" style="width:100%;max-width:620px;">
+    <tr>
+      <td style="background:${PANEL_BG};border:1px solid ${PANEL_BORDER};border-radius:24px;padding:0;overflow:hidden;box-shadow:0 24px 56px rgba(0,0,0,0.35);">
+        <table role="presentation" width="100%" style="width:100%;">
+          <tr>
+            <td class="mobile-pad" style="padding:26px;background:#7C3AED;">
+              <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.4;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#F8FAFC;">
+                PEEZUHUB PREMIUM
+              </div>
+              <div style="margin-top:16px;font-family:Arial,Helvetica,sans-serif;font-size:30px;line-height:1.18;font-weight:800;color:#FFFFFF;letter-spacing:-0.02em;">
+                Your Seller Premium is now active
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td class="mobile-pad" style="padding:28px 26px 30px;background:${PANEL_BG};font-family:Arial,Helvetica,sans-serif;color:${BODY_TEXT};">
+              <div style="font-size:15px;line-height:1.8;color:${BODY_TEXT};">
+                Hi <strong>${escHtml(userName)}</strong>, your payment was successful and your <strong>Seller Premium</strong> plan is now active.
+                All your current listings are featured and verified, and future listings will automatically receive premium treatment until your plan expires.
+              </div>
 
-    <p>Hi <strong>${escHtml(userName)}</strong>,</p>
-    <p>
-      Your payment was successful and your <strong>Seller Premium</strong> plan is now
-      <span class="badge badge-success">ACTIVE</span>.
-      All your current listings are now featured &amp; verified, and any new listings
-      you post will automatically receive premium visibility until your plan expires.
-    </p>
+              <table role="presentation" width="100%" style="width:100%;margin-top:22px;background:${CARD_BG};border:1px solid ${PANEL_BORDER};border-radius:20px;overflow:hidden;">
+                <tbody>
+                  ${buildFieldRows([
+                    { label: 'Reference', value: reference },
+                    { label: 'Account email', value: userEmail },
+                    { label: 'Amount paid', value: `₦${Number(amountNaira).toLocaleString('en-NG')}` },
+                    { label: 'Plan', value: 'Seller Premium – All listings' },
+                    { label: 'Activated', value: activatedStr },
+                    { label: 'Expires', value: expiryStr },
+                  ])}
+                </tbody>
+              </table>
 
-    <table class="fields"><tbody>
-      <tr><td class="label">Reference</td><td class="value">${escHtml(reference)}</td></tr>
-      <tr><td class="label">Account email</td><td class="value">${escHtml(userEmail)}</td></tr>
-      <tr><td class="label">Amount paid</td><td class="value">₦${Number(amountNaira).toLocaleString('en-NG')}</td></tr>
-      <tr><td class="label">Plan</td><td class="value">Seller Premium – All listings</td></tr>
-      <tr><td class="label">Activated</td><td class="value">${escHtml(activatedStr)}</td></tr>
-      <tr><td class="label">Expires</td><td class="value">${escHtml(expiryStr)}</td></tr>
-    </tbody></table>
+              <table role="presentation" width="100%" style="width:100%;margin-top:20px;background:#1C2533;border:1px solid ${PANEL_BORDER};border-left:4px solid #A855F7;border-radius:16px;">
+                <tr>
+                  <td style="padding:16px 18px;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.8;color:#E2E8F0;word-break:break-word;overflow-wrap:anywhere;">
+                    Premium benefits are now active on your account: featured badge, verified seller mark, stronger listing visibility and priority placement.
+                  </td>
+                </tr>
+              </table>
 
-    <div style="margin:16px 0 20px;padding:14px 16px;border:1px solid ${BORDER_COLOR};border-radius:12px;background:#fff;word-break:break-word;overflow-wrap:anywhere;">
-      <p style="margin:0 0 6px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:${MUTED_TEXT};">Premium account email</p>
-      <p style="margin:0;font-size:15px;line-height:1.7;color:${BRAND_TEXT};word-break:break-word;overflow-wrap:anywhere;">${escHtml(userEmail)}</p>
-    </div>
-
-    <p style="background:${BRAND_LIGHT_BG};border-left:4px solid ${BRAND_PRIMARY}; padding:14px 16px;border-radius:0 8px 8px 0;font-size:14px;color:${BRAND_TEXT};">
-      🎉 <strong>What you get:</strong> Featured badge on all listings, verified seller tick,
-      priority placement in search results, and premium visibility across the platform.
-    </p>
-
-    <div class="btn-wrap">
-      <a class="btn" href="${escHtml(dashboardUrl)}">Go to My Dashboard →</a>
-    </div>
-
-    <p style="font-size:13px;color:${MUTED_TEXT};margin-top:24px; border-top:1px solid ${BORDER_COLOR};padding-top:16px;">
-      If you have any questions, reply to this email or contact us at
-      <a href="mailto:${getSupportEmail()}">${getSupportEmail()}</a>.
-    </p>
-  `;
+              <div style="margin-top:24px;">
+                <a href="${escHtml(dashboardUrl)}" class="button-full" style="display:inline-block;background:#7C3AED;color:#FFFFFF;padding:14px 24px;border-radius:14px;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:800;line-height:1.2;">
+                  Go to My Dashboard
+                </a>
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding:14px 16px 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.8;color:${MUTED_TEXT};text-align:center;word-break:break-word;overflow-wrap:anywhere;">
+        Need help? <a href="mailto:${escHtml(supportEmail)}" style="color:#C4B5FD;">${escHtml(supportEmail)}</a><br />
+        &copy; ${new Date().getFullYear()} ${escHtml(APP_NAME)}. All rights reserved.
+      </td>
+    </tr>
+  </table>`;
 
   const plainText = [
     `${APP_NAME} – Premium Activated`,
@@ -245,23 +395,15 @@ function buildPremiumConfirmEmail({ userName, userEmail, reference, amountNaira,
     `Activated : ${activatedStr}`,
     `Expires   : ${expiryStr}`,
     '',
-    'All your current listings are now featured & verified.',
-    '',
     `Visit your dashboard: ${dashboardUrl}`,
     '',
-    `Need help? Email: ${getSupportEmail()}`,
+    `Need help? Email: ${supportEmail}`,
   ].join('\n');
 
-  return { html: wrapLayout(bodyHtml, `Your ${APP_NAME} Seller Premium is now active!`), text: plainText };
-}
-
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  return {
+    html: wrapLayout({ previewText: `Your ${APP_NAME} Seller Premium is now active!`, contentHtml }),
+    text: plainText,
+  };
 }
 
 module.exports = {
@@ -273,4 +415,5 @@ module.exports = {
   getAdminDashboardUrl,
   buildAdminAlertEmail,
   buildPremiumConfirmEmail,
+  stripHtml,
 };

@@ -1,34 +1,32 @@
 'use strict';
 /**
- * PeezuHub – resilient SMTP mailer for Render/Gmail
- * -------------------------------------------------
- * Creates a fresh transport per send, avoids stale pooled sockets,
- * and retries once on transient timeout / connection errors.
- *
- * Safety improvement:
- * - Nodemailer is loaded lazily so a missing dependency never crashes boot.
- * - If SMTP/nodemailer is unavailable, the API keeps running and logs a warning.
+ * PeezuHub – resilient email delivery for Render + Gmail
+ * ------------------------------------------------------
+ * Strategy order:
+ * 1) Gmail API over HTTPS (best for Render free instances because SMTP ports can be blocked)
+ * 2) SMTP via Nodemailer with explicit Gmail host/port fallback
  */
+
+const axios = require('axios');
 
 let nodemailerInstance = null;
 let nodemailerLoadAttempted = false;
+const gmailTokenCache = {
+  accessToken: '',
+  expiresAt: 0,
+};
 
 function getNodemailer() {
-  if (nodemailerLoadAttempted) {
-    return nodemailerInstance;
-  }
+  if (nodemailerLoadAttempted) return nodemailerInstance;
 
   nodemailerLoadAttempted = true;
 
   try {
-    // Load lazily so app startup does not crash when the dependency is missing.
-    // The package is still declared in package.json and should be installed normally.
-    // This fallback simply keeps production booting instead of hard-failing.
     // eslint-disable-next-line global-require
     nodemailerInstance = require('nodemailer');
   } catch (error) {
     nodemailerInstance = null;
-    console.error('[PeezuHub] nodemailer is not installed or could not be loaded:', error.message);
+    console.error('[PeezuHub] nodemailer could not be loaded:', error.message);
   }
 
   return nodemailerInstance;
@@ -65,109 +63,271 @@ function getMailBrandName() {
   );
 }
 
-function getFromAddress() {
-  if (process.env.SMTP_FROM && process.env.SMTP_FROM.trim()) {
-    return process.env.SMTP_FROM.trim();
-  }
+function extractEmailAddress(value = '') {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) return '';
 
-  if (process.env.SMTP_USER && process.env.SMTP_USER.trim()) {
-    return `${getMailBrandName()} <${process.env.SMTP_USER.trim()}>`;
-  }
-
-  return undefined;
+  const match = trimmed.match(/<([^>]+)>/);
+  if (match?.[1]) return match[1].trim();
+  return trimmed;
 }
 
-function isGmailTransport({ service, host, user }) {
-  const normalizedService = String(service || '').trim().toLowerCase();
-  const normalizedHost = String(host || '').trim().toLowerCase();
-  const normalizedUser = String(user || '').trim().toLowerCase();
-
+function getSenderEmail() {
   return (
-    normalizedService === 'gmail' ||
-    normalizedHost === 'smtp.gmail.com' ||
-    normalizedHost.endsWith('.gmail.com') ||
-    normalizedUser.endsWith('@gmail.com')
+    extractEmailAddress(process.env.GMAIL_SENDER_EMAIL) ||
+    extractEmailAddress(process.env.SMTP_FROM) ||
+    extractEmailAddress(process.env.SMTP_USER)
   );
 }
 
-function buildTransportConfig() {
+function getFromAddress() {
+  const senderEmail = getSenderEmail();
+  if (!senderEmail) return undefined;
+  return `${getMailBrandName()} <${senderEmail}>`;
+}
+
+function isLikelyGmailAddress(value = '') {
+  return String(value).trim().toLowerCase().endsWith('@gmail.com');
+}
+
+function shouldUseGmailApi() {
+  const mode = String(process.env.EMAIL_DELIVERY_MODE || process.env.MAIL_DELIVERY_MODE || 'auto')
+    .trim()
+    .toLowerCase();
+
+  const hasOauthConfig = Boolean(
+    process.env.GOOGLE_CLIENT_ID?.trim() &&
+      process.env.GOOGLE_CLIENT_SECRET?.trim() &&
+      process.env.GOOGLE_REFRESH_TOKEN?.trim() &&
+      getSenderEmail()
+  );
+
+  if (mode === 'gmail_api') return hasOauthConfig;
+  if (mode === 'smtp') return false;
+  return hasOauthConfig;
+}
+
+function encodeHeader(value = '') {
+  const safe = String(value || '');
+  return /[^\x00-\x7F]/.test(safe)
+    ? `=?UTF-8?B?${Buffer.from(safe, 'utf8').toString('base64')}?=`
+    : safe;
+}
+
+function chunkBase64(value = '') {
+  return String(value).replace(/.{1,76}/g, '$&\r\n').trim();
+}
+
+function toBase64Url(value = '') {
+  return Buffer.from(String(value), 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function buildMimeMessage({ from, to, cc, bcc, replyTo, subject, html, text }) {
+  const boundary = `peezuhub-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const plainText = text || stripHtml(html);
+
+  const lines = [
+    'MIME-Version: 1.0',
+    `Date: ${new Date().toUTCString()}`,
+    `From: ${from}`,
+    `To: ${normalizeRecipients(to).join(', ')}`,
+    cc ? `Cc: ${normalizeRecipients(cc).join(', ')}` : '',
+    bcc ? `Bcc: ${normalizeRecipients(bcc).join(', ')}` : '',
+    replyTo ? `Reply-To: ${replyTo}` : '',
+    `Subject: ${encodeHeader(subject)}`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    chunkBase64(Buffer.from(String(plainText), 'utf8').toString('base64')),
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    chunkBase64(Buffer.from(String(html), 'utf8').toString('base64')),
+    '',
+    `--${boundary}--`,
+    '',
+  ].filter(Boolean);
+
+  return lines.join('\r\n');
+}
+
+async function getGmailApiAccessToken() {
+  if (gmailTokenCache.accessToken && gmailTokenCache.expiresAt - Date.now() > 60_000) {
+    return gmailTokenCache.accessToken;
+  }
+
+  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN?.trim();
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error('Missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET or GOOGLE_REFRESH_TOKEN for Gmail API delivery.');
+  }
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token',
+  });
+
+  const response = await axios.post('https://oauth2.googleapis.com/token', params.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 20_000,
+  });
+
+  gmailTokenCache.accessToken = response.data.access_token;
+  gmailTokenCache.expiresAt = Date.now() + Number(response.data.expires_in || 3600) * 1000;
+  return gmailTokenCache.accessToken;
+}
+
+async function sendViaGmailApi(mailOptions) {
+  const senderEmail = getSenderEmail();
+  if (!senderEmail) {
+    throw new Error('A sender email is required for Gmail API delivery.');
+  }
+
+  const accessToken = await getGmailApiAccessToken();
+  const raw = toBase64Url(
+    buildMimeMessage({
+      ...mailOptions,
+      from: mailOptions.from || `${getMailBrandName()} <${senderEmail}>`,
+    })
+  );
+
+  await axios.post(
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+    { raw },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 20_000,
+    }
+  );
+}
+
+function buildSmtpTransportConfigs() {
   const SMTP_SERVICE = (process.env.SMTP_SERVICE || '').trim();
   const SMTP_HOST = (process.env.SMTP_HOST || '').trim();
   const SMTP_USER = (process.env.SMTP_USER || '').trim();
   const SMTP_PASS = (process.env.SMTP_PASS || '').trim();
+  const SMTP_PORT = Number(process.env.SMTP_PORT || 0);
+  const secureOverride = String(process.env.SMTP_SECURE || '').trim().toLowerCase();
 
-  if (!SMTP_USER || !SMTP_PASS || (!SMTP_SERVICE && !SMTP_HOST)) {
-    return null;
+  if (!SMTP_USER || !SMTP_PASS) return [];
+
+  const gmailLike =
+    String(SMTP_SERVICE).trim().toLowerCase() === 'gmail' ||
+    String(SMTP_HOST).trim().toLowerCase() === 'smtp.gmail.com' ||
+    isLikelyGmailAddress(SMTP_USER);
+
+  const configs = [];
+
+  if (SMTP_HOST) {
+    const port = SMTP_PORT || (secureOverride === 'true' ? 465 : gmailLike ? 465 : 587);
+    const secure = secureOverride ? secureOverride === 'true' : port === 465;
+
+    configs.push({
+      host: SMTP_HOST,
+      port,
+      secure,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+      connectionTimeout: 30_000,
+      greetingTimeout: 30_000,
+      socketTimeout: 45_000,
+      tls: {
+        minVersion: 'TLSv1.2',
+        servername: SMTP_HOST,
+      },
+    });
+
+    if (gmailLike && !SMTP_PORT && !secureOverride) {
+      configs.push({
+        host: SMTP_HOST,
+        port: 587,
+        secure: false,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+        connectionTimeout: 30_000,
+        greetingTimeout: 30_000,
+        socketTimeout: 45_000,
+        requireTLS: true,
+        tls: {
+          minVersion: 'TLSv1.2',
+          servername: SMTP_HOST,
+        },
+      });
+    }
+
+    return configs;
   }
 
-  const gmailMode = isGmailTransport({
+  if (gmailLike) {
+    configs.push(
+      {
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+        connectionTimeout: 30_000,
+        greetingTimeout: 30_000,
+        socketTimeout: 45_000,
+        tls: {
+          minVersion: 'TLSv1.2',
+          servername: 'smtp.gmail.com',
+        },
+      },
+      {
+        host: 'smtp.gmail.com',
+        port: 587,
+        secure: false,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+        connectionTimeout: 30_000,
+        greetingTimeout: 30_000,
+        socketTimeout: 45_000,
+        requireTLS: true,
+        tls: {
+          minVersion: 'TLSv1.2',
+          servername: 'smtp.gmail.com',
+        },
+      }
+    );
+
+    return configs;
+  }
+
+  if (!SMTP_SERVICE) return [];
+
+  const secure = secureOverride === 'true';
+  configs.push({
     service: SMTP_SERVICE,
-    host: SMTP_HOST,
-    user: SMTP_USER,
-  });
-
-  const fallbackPort = gmailMode ? 465 : 587;
-  const port = Number(process.env.SMTP_PORT || fallbackPort);
-  const secure = String(process.env.SMTP_SECURE || '').trim()
-    ? String(process.env.SMTP_SECURE).trim().toLowerCase() === 'true'
-    : port === 465;
-
-  const config = {
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
     secure,
-    pool: false,
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-    socketTimeout: 30000,
-    requireTLS: !secure,
+    connectionTimeout: 30_000,
+    greetingTimeout: 30_000,
+    socketTimeout: 45_000,
     tls: {
       minVersion: 'TLSv1.2',
-      rejectUnauthorized: true,
     },
-  };
+  });
 
-  if (gmailMode) {
-    config.service = 'gmail';
-  } else if (SMTP_SERVICE) {
-    config.service = SMTP_SERVICE;
-  } else {
-    config.host = SMTP_HOST;
-    config.port = port;
-    if (SMTP_HOST) {
-      config.tls.servername = SMTP_HOST;
-    }
-  }
-
-  if (!config.port && !config.service) {
-    config.port = port;
-  }
-
-  return config;
-}
-
-function createTransporter() {
-  const nodemailer = getNodemailer();
-  if (!nodemailer) {
-    console.warn('[PeezuHub] Email transport unavailable because nodemailer could not be loaded.');
-    return null;
-  }
-
-  const config = buildTransportConfig();
-  if (!config) {
-    console.warn('[PeezuHub] SMTP not fully configured - emails will be skipped.');
-    return null;
-  }
-
-  return nodemailer.createTransport(config);
+  return configs;
 }
 
 function shouldRetryMailError(error) {
-  const code = String(error && error.code ? error.code : '').toUpperCase();
-  const command = String(error && error.command ? error.command : '').toUpperCase();
-  const message = String(error && error.message ? error.message : '').toLowerCase();
+  const code = String(error?.code || '').toUpperCase();
+  const command = String(error?.command || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
 
   return (
     ['ETIMEDOUT', 'ECONNECTION', 'ECONNRESET', 'ESOCKET', 'EPIPE'].includes(code) ||
@@ -180,8 +340,53 @@ function shouldRetryMailError(error) {
   );
 }
 
-async function deliverMail(client, mailOptions) {
-  return client.sendMail(mailOptions);
+function explainPossibleRenderBlock(error) {
+  const isRender = String(process.env.RENDER || '').trim().toLowerCase() === 'true';
+  const message = String(error?.message || '').toLowerCase();
+  const code = String(error?.code || '').toUpperCase();
+
+  if (!isRender) return '';
+  if (!['ETIMEDOUT', 'ECONNECTION', 'ESOCKET'].includes(code) && !message.includes('timeout')) return '';
+
+  return ' Render commonly blocks outbound SMTP on free web services; switch EMAIL_DELIVERY_MODE to gmail_api with GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN, or upgrade the instance before relying on Gmail SMTP.';
+}
+
+async function sendViaSmtp(mailOptions) {
+  const nodemailer = getNodemailer();
+  if (!nodemailer) {
+    console.warn('[PeezuHub] Email transport unavailable because nodemailer could not be loaded.');
+    return false;
+  }
+
+  const configs = buildSmtpTransportConfigs();
+  if (!configs.length) {
+    console.warn('[PeezuHub] SMTP not fully configured - emails will be skipped.');
+    return false;
+  }
+
+  let lastError = null;
+
+  for (const config of configs) {
+    const target = config.service || `${config.host}:${config.port}`;
+
+    try {
+      const client = nodemailer.createTransport(config);
+      await client.sendMail(mailOptions);
+      console.log(`[PeezuHub] Email sent via SMTP (${target}) -> ${mailOptions.to} | ${mailOptions.subject}`);
+      return true;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[PeezuHub] SMTP delivery failed via ${target}: ${error.message}`);
+
+      if (!shouldRetryMailError(error)) break;
+    }
+  }
+
+  if (lastError) {
+    console.error(`[PeezuHub] SMTP delivery exhausted (${mailOptions.subject}): ${lastError.message}.${explainPossibleRenderBlock(lastError)}`);
+  }
+
+  return false;
 }
 
 async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
@@ -194,9 +399,6 @@ async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
     return false;
   }
 
-  const client = createTransporter();
-  if (!client) return false;
-
   const mailOptions = {
     from: getFromAddress(),
     to: toList.join(', '),
@@ -208,29 +410,17 @@ async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
     text: text || stripHtml(html),
   };
 
-  try {
-    await deliverMail(client, mailOptions);
-    console.log(`[PeezuHub] Email sent -> ${toList.join(', ')} | ${subject}`);
-    return true;
-  } catch (error) {
-    if (!shouldRetryMailError(error)) {
-      console.error(`[PeezuHub] sendEmail error (${subject}):`, error.message);
-      return false;
-    }
-
-    console.warn(`[PeezuHub] SMTP transient error, retrying once (${subject}): ${error.message}`);
-
+  if (shouldUseGmailApi()) {
     try {
-      const retryClient = createTransporter();
-      if (!retryClient) return false;
-      await deliverMail(retryClient, mailOptions);
-      console.log(`[PeezuHub] Email sent on retry -> ${toList.join(', ')} | ${subject}`);
+      await sendViaGmailApi(mailOptions);
+      console.log(`[PeezuHub] Email sent via Gmail API -> ${toList.join(', ')} | ${subject}`);
       return true;
-    } catch (retryError) {
-      console.error(`[PeezuHub] sendEmail retry failed (${subject}):`, retryError.message);
-      return false;
+    } catch (error) {
+      console.error(`[PeezuHub] Gmail API delivery failed (${subject}): ${error.message}`);
     }
   }
+
+  return sendViaSmtp(mailOptions);
 }
 
 function queueEmail(payload) {
