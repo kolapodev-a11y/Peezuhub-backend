@@ -55,6 +55,7 @@ router.post('/contact/:listingId', optionalAuth, async (req, res) => {
       messageId: record._id.toString(),
       fromUserId: req.user?._id?.toString() || '',
       senderName,
+      actionUrl: '/profile',
     },
   });
 

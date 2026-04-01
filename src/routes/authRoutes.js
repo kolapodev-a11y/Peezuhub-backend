@@ -8,6 +8,7 @@ const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { auth, adminOnly } = require('../middleware/auth');
+const { adminRoleForEmail, syncUserRoleFromAdminEmails } = require('../utils/authRole');
 
 const router = express.Router();
 const APP_NAME = process.env.APP_NAME || 'PeezuHub';
@@ -16,18 +17,6 @@ const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : nul
 
 function signToken(user) {
   return jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-}
-
-function getAdminEmails() {
-  const raw = process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || 'peezutech@gmail.com';
-  return raw
-    .split(',')
-    .map((email) => email.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function adminRoleForEmail(email = '') {
-  return getAdminEmails().includes(String(email).toLowerCase()) ? 'admin' : 'user';
 }
 
 function serializeUser(user) {
@@ -120,6 +109,7 @@ async function createSignupNotification(user, method) {
         userId: user._id.toString(),
         email: user.email,
         method,
+        actionUrl: '/admin?tab=users',
       },
     });
   } catch (error) {
@@ -300,6 +290,7 @@ router.post('/google', async (req, res) => {
 
 router.get('/me', auth, async (req, res) => {
   const freshUser = await User.findById(req.user._id).select('-passwordHash');
+  await syncUserRoleFromAdminEmails(freshUser);
   res.json({ user: serializeUser(freshUser) });
 });
 
