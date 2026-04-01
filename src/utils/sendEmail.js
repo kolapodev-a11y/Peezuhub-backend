@@ -56,13 +56,22 @@ function stripHtml(html = '') {
     .trim();
 }
 
+function getMailBrandName() {
+  return (
+    process.env.MAIL_APP_NAME?.trim() ||
+    process.env.PEEZUHUB_APP_NAME?.trim() ||
+    process.env.APP_NAME?.trim() ||
+    'PeezuHub'
+  );
+}
+
 function getFromAddress() {
   if (process.env.SMTP_FROM && process.env.SMTP_FROM.trim()) {
     return process.env.SMTP_FROM.trim();
   }
 
   if (process.env.SMTP_USER && process.env.SMTP_USER.trim()) {
-    return `${process.env.APP_NAME || 'PeezuHub'} <${process.env.SMTP_USER.trim()}>`;
+    return `${getMailBrandName()} <${process.env.SMTP_USER.trim()}>`;
   }
 
   return undefined;
