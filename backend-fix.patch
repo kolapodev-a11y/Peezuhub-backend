@@ -1,0 +1,295 @@
+diff --git a/.env.example b/.env.example
+index cf09539..4b05895 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,11 +1,20 @@
+ PORT=5000
+ MONGODB_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/peezuhub?retryWrites=true&w=majority&appName=PeezuHub
+ JWT_SECRET=change_me_to_a_long_random_secret
++APP_NAME=PeezuHub
+ CLIENT_URL=http://localhost:5173
++ADMIN_DASHBOARD_URL=http://localhost:5173/admin
+ ADMIN_EMAIL=peezutech@gmail.com
+ GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
+ PAYSTACK_SECRET_KEY=sk_test_xxxxxxxxxxxxxxxxxxxxx
+ PAYSTACK_PUBLIC_KEY=pk_test_xxxxxxxxxxxxxxxxxxxxx
+-COURIER_API_KEY=pk_prod_or_test_from_courier_dashboard
+-COURIER_FROM_EMAIL=PeezuHub <peezutech@gmail.com>
+-COURIER_REPLY_TO=peezutech@gmail.com
++SMTP_SERVICE=gmail
++SMTP_USER=peezutech@gmail.com
++SMTP_PASS=your_gmail_app_password
++SMTP_FROM=PeezuHub <peezutech@gmail.com>
++
++# The current codebase sends branded emails with src/utils/sendEmail.js and src/utils/emailTemplates.js.
++# COURIER_* values are not used by these repositories and can be removed from production if no other service needs them.
++COURIER_API_KEY=
++COURIER_FROM_EMAIL=
++COURIER_REPLY_TO=
+diff --git a/src/middleware/auth.js b/src/middleware/auth.js
+index 1624773..b01aff8 100644
+--- a/src/middleware/auth.js
++++ b/src/middleware/auth.js
+@@ -1,5 +1,6 @@
+ const jwt = require('jsonwebtoken');
+ const User = require('../models/User');
++const { syncUserRoleFromAdminEmails } = require('../utils/authRole');
+ 
+ async function resolveUserFromHeader(header = '') {
+   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+@@ -8,7 +9,10 @@ async function resolveUserFromHeader(header = '') {
+   try {
+     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+     const user = await User.findById(decoded.id).select('-passwordHash');
+-    return user || null;
++    if (!user) return null;
++
++    await syncUserRoleFromAdminEmails(user);
++    return user;
+   } catch {
+     return null;
+   }
+diff --git a/src/routes/authRoutes.js b/src/routes/authRoutes.js
+index 2d304fb..a61e12a 100644
+--- a/src/routes/authRoutes.js
++++ b/src/routes/authRoutes.js
+@@ -8,6 +8,7 @@ const { OAuth2Client } = require('google-auth-library');
+ const User = require('../models/User');
+ const Notification = require('../models/Notification');
+ const { auth, adminOnly } = require('../middleware/auth');
++const { adminRoleForEmail, syncUserRoleFromAdminEmails } = require('../utils/authRole');
+ 
+ const router = express.Router();
+ const APP_NAME = process.env.APP_NAME || 'PeezuHub';
+@@ -18,18 +19,6 @@ function signToken(user) {
+   return jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+ }
+ 
+-function getAdminEmails() {
+-  const raw = process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || 'peezutech@gmail.com';
+-  return raw
+-    .split(',')
+-    .map((email) => email.trim().toLowerCase())
+-    .filter(Boolean);
+-}
+-
+-function adminRoleForEmail(email = '') {
+-  return getAdminEmails().includes(String(email).toLowerCase()) ? 'admin' : 'user';
+-}
+-
+ function serializeUser(user) {
+   return {
+     _id: user._id.toString(),
+@@ -120,6 +109,7 @@ async function createSignupNotification(user, method) {
+         userId: user._id.toString(),
+         email: user.email,
+         method,
++        actionUrl: '/admin?tab=users',
+       },
+     });
+   } catch (error) {
+@@ -300,6 +290,7 @@ router.post('/google', async (req, res) => {
+ 
+ router.get('/me', auth, async (req, res) => {
+   const freshUser = await User.findById(req.user._id).select('-passwordHash');
++  await syncUserRoleFromAdminEmails(freshUser);
+   res.json({ user: serializeUser(freshUser) });
+ });
+ 
+diff --git a/src/routes/listingRoutes.js b/src/routes/listingRoutes.js
+index 050be46..23b0715 100644
+--- a/src/routes/listingRoutes.js
++++ b/src/routes/listingRoutes.js
+@@ -133,7 +133,7 @@ router.get('/featured', async (_req, res) => {
+   })
+     .sort({ featuredUntil: -1, createdAt: -1 })
+     .limit(12)
+-    .populate('user', 'name avatar');
++    .populate('user', 'name avatar role');
+ 
+   res.json(featured);
+ });
+@@ -158,7 +158,7 @@ router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
+     totalUsers,
+     allListings,
+   ] = await Promise.all([
+-    Listing.find({ status: 'pending' }).populate('user', 'name email avatar').sort({ createdAt: -1 }),
++    Listing.find({ status: 'pending' }).populate('user', 'name email avatar role').sort({ createdAt: -1 }),
+     Report.find({ status: 'open' }).populate({ path: 'listing', populate: { path: 'user', select: 'name email' } }).sort({ createdAt: -1 }),
+     Notification.countDocuments({ isRead: false }),
+     Listing.countDocuments({ status: 'pending' }),
+@@ -169,7 +169,7 @@ router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
+     Listing.countDocuments({ saleStatus: 'sold' }),
+     User.countDocuments({ premiumStatus: 'active' }),
+     User.countDocuments(),
+-    Listing.find().populate('user', 'name email avatar').sort({ createdAt: -1 }).limit(100),
++    Listing.find().populate('user', 'name email avatar role').sort({ createdAt: -1 }).limit(100),
+   ]);
+ 
+   res.json({
+@@ -213,14 +213,14 @@ router.get('/', async (req, res) => {
+   }
+ 
+   const listings = await Listing.find(query)
+-    .populate('user', 'name avatar')
++    .populate('user', 'name avatar role')
+     .sort(getPublicSort(sort));
+ 
+   res.json(listings);
+ });
+ 
+ router.get('/:id', async (req, res) => {
+-  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar premiumStatus premiumExpiresAt');
++  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar role premiumStatus premiumExpiresAt');
+   if (!listing) return res.status(404).json({ message: 'Listing not found' });
+   res.json(listing);
+ });
+@@ -288,7 +288,7 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
+     type: 'submission',
+     title: 'New listing submitted',
+     message: `${title} was submitted in ${city}, ${state}`,
+-    meta: { listingId: listing._id.toString(), status: moderationStatus },
++    meta: { listingId: listing._id.toString(), status: moderationStatus, actionUrl: '/admin?tab=pending' },
+   });
+ 
+   const newListingEmail = buildAdminAlertEmail({
+@@ -425,12 +425,29 @@ router.patch('/:id/status', auth, adminOnly, async (req, res) => {
+   syncListingPremiumState(listing, listing.user);
+   await listing.save();
+ 
+-  await Notification.create({
+-    type: 'moderation',
+-    title: `Listing ${action}d`,
+-    message: `${listing.title} has been ${action}d`,
+-    meta: { listingId: listing._id.toString(), action },
+-  });
++  await Promise.all([
++    Notification.create({
++      type: 'moderation',
++      title: `Listing ${action}d`,
++      message: `${listing.title} has been ${action}d`,
++      meta: { listingId: listing._id.toString(), action, actionUrl: '/admin?tab=all_listings' },
++    }),
++    Notification.create({
++      user: listing.user._id,
++      type: action === 'approve' ? 'listing_approved' : 'listing_rejected',
++      title: action === 'approve' ? 'Your listing was approved' : 'Your listing was rejected',
++      message:
++        action === 'approve'
++          ? `${listing.title} is now live on ${APP_NAME}.`
++          : `${listing.title} was rejected${reason ? `: ${reason}` : '.'}`, 
++      meta: {
++        listingId: listing._id.toString(),
++        action,
++        reason: reason || '',
++        actionUrl: `/listings/${listing._id.toString()}`, 
++      },
++    }),
++  ]);
+ 
+   res.json(listing);
+ });
+@@ -457,6 +474,18 @@ router.post('/:id/reviews', auth, async (req, res) => {
+   updateRatingStats(listing);
+   await listing.save();
+ 
++  await Notification.create({
++    user: listing.user,
++    type: 'review',
++    title: 'New review on your listing',
++    message: `${req.user.name} left a ${Number(rating)}/5 review on ${listing.title}.`,
++    meta: {
++      listingId: listing._id.toString(),
++      reviewerId: req.user._id.toString(),
++      actionUrl: `/listings/${listing._id.toString()}`, 
++    },
++  });
++
+   res.status(201).json(listing);
+ });
+ 
+@@ -481,7 +510,7 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
+     type: 'report',
+     title: 'Listing reported',
+     message: `${listing.title} was reported by ${reporterName}`,
+-    meta: { listingId: listing._id.toString(), reportId: report._id.toString() },
++    meta: { listingId: listing._id.toString(), reportId: report._id.toString(), actionUrl: '/admin?tab=reports' },
+   });
+ 
+   const reportEmail = buildAdminAlertEmail({
+diff --git a/src/routes/messageRoutes.js b/src/routes/messageRoutes.js
+index 674d388..911bfd8 100644
+--- a/src/routes/messageRoutes.js
++++ b/src/routes/messageRoutes.js
+@@ -55,6 +55,7 @@ router.post('/contact/:listingId', optionalAuth, async (req, res) => {
+       messageId: record._id.toString(),
+       fromUserId: req.user?._id?.toString() || '',
+       senderName,
++      actionUrl: '/profile',
+     },
+   });
+ 
+diff --git a/src/routes/paymentRoutes.js b/src/routes/paymentRoutes.js
+index 79fd1ee..5543e9a 100644
+--- a/src/routes/paymentRoutes.js
++++ b/src/routes/paymentRoutes.js
+@@ -123,6 +123,9 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
+           userId: user._id.toString(),
+           plan: 'seller_premium',
+           appliesTo: 'all_current_and_future_listings',
++          sourceApp: APP_NAME,
++          sourceAppSlug: 'peezuhub',
++          transactionKind: 'seller_premium_upgrade',
+         },
+       },
+       {
+@@ -144,7 +147,7 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
+       type: 'premium_upgrade_pending',
+       title: 'Premium upgrade initiated',
+       message: `${user.name} started a seller premium upgrade payment.`,
+-      meta: { userId: user._id.toString(), reference },
++      meta: { userId: user._id.toString(), reference, actionUrl: '/admin?tab=notifications' },
+     });
+ 
+     res.json({ authorizationUrl: response.data.data.authorization_url, reference });
+@@ -244,16 +247,30 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
+           text: buyerEmail.text,
+         });
+ 
+-        await Notification.create({
+-          type: 'premium_upgrade_paid',
+-          title: 'Seller premium activated',
+-          message: `${user.name} completed a premium upgrade. Listings will be featured until ${expiresAt.toLocaleDateString('en-NG')}.`,
+-          meta: {
+-            userId: user._id.toString(),
+-            reference,
+-            expiresAt: expiresAt.toISOString(),
+-          },
+-        });
++        await Promise.all([
++          Notification.create({
++            type: 'premium_upgrade_paid',
++            title: 'Seller premium activated',
++            message: `${user.name} completed a premium upgrade. Listings will be featured until ${expiresAt.toLocaleDateString('en-NG')}.`,
++            meta: {
++              userId: user._id.toString(),
++              reference,
++              expiresAt: expiresAt.toISOString(),
++              actionUrl: '/admin?tab=notifications',
++            },
++          }),
++          Notification.create({
++            user: user._id,
++            type: 'premium_active',
++            title: 'Seller premium is active',
++            message: `Your seller premium upgrade is now active until ${expiresAt.toLocaleDateString('en-NG')}.`,
++            meta: {
++              reference,
++              expiresAt: expiresAt.toISOString(),
++              actionUrl: '/profile?tab=notifications',
++            },
++          }),
++        ]);
+       }
+     }
+ 
