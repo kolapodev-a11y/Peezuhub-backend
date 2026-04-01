@@ -1,0 +1,540 @@
+const express = require('express');
+const multer = require('multer');
+const Listing = require('../models/Listing');
+const Report = require('../models/Report');
+const Notification = require('../models/Notification');
+const Message = require('../models/Message');
+const User = require('../models/User');
+const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
+const { detectScamText } = require('../utils/scamCheck');
+const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
+const { queueEmail } = require('../utils/sendEmail');
+const {
+  APP_NAME,
+  buildAdminAlertEmail,
+  formatDateTime,
+  getAdminNotificationRecipients,
+} = require('../utils/emailTemplates');
+
+const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
+
+function sanitizeWhatsapp(value = '') {
+  return value.replace(/[^\d]/g, '');
+}
+
+function toBase64Photos(files = []) {
+  return files.map((file) => `data:${file.mimetype};base64,${file.buffer.toString('base64')}`);
+}
+
+function updateRatingStats(listing) {
+  const total = listing.reviews.reduce((sum, review) => sum + review.rating, 0);
+  listing.reviewsCount = listing.reviews.length;
+  listing.averageRating = listing.reviews.length ? Number((total / listing.reviews.length).toFixed(1)) : 0;
+}
+
+function isValidCategory(category) {
+  return CATEGORIES.includes(category);
+}
+
+function parsePhotosField(rawValue) {
+  if (!rawValue) return [];
+  if (Array.isArray(rawValue)) return rawValue.filter(Boolean);
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function getPublicSort(sort = 'newest') {
+  if (sort === 'highest_rated') {
+    return { isFeatured: -1, featuredUntil: -1, averageRating: -1, createdAt: -1 };
+  }
+
+  if (sort === 'lowest_price') {
+    return { isFeatured: -1, featuredUntil: -1, startingPrice: 1, createdAt: -1 };
+  }
+
+  return { isFeatured: -1, featuredUntil: -1, createdAt: -1 };
+}
+
+function hasActiveSellerPremium(user) {
+  return Boolean(
+    user?.premiumStatus === 'active' &&
+    user?.premiumExpiresAt &&
+    new Date(user.premiumExpiresAt) > new Date()
+  );
+}
+
+function syncListingPremiumState(listing, user) {
+  const hasPremium = hasActiveSellerPremium(user);
+
+  if (!hasPremium) {
+    listing.isFeatured = false;
+    listing.isVerified = false;
+
+    if (!listing.featuredUntil || new Date(listing.featuredUntil) <= new Date()) {
+      listing.featuredUntil = null;
+      listing.premiumPaymentStatus = 'unpaid';
+      listing.premiumRequested = false;
+      listing.paystackReference = '';
+    }
+
+    return;
+  }
+
+  listing.premiumRequested = true;
+  listing.premiumPaymentStatus = 'paid';
+  listing.paystackReference = user.premiumReference || listing.paystackReference;
+  listing.featuredUntil = new Date(user.premiumExpiresAt);
+
+  const shouldSurfacePremium = listing.saleStatus === 'available' && listing.status === 'approved';
+  listing.isFeatured = shouldSurfacePremium;
+  listing.isVerified = shouldSurfacePremium;
+}
+
+function applySaleStatusEffects(listing, saleStatus, user) {
+  listing.saleStatus = saleStatus;
+  listing.soldAt = saleStatus === 'sold' ? new Date() : null;
+  syncListingPremiumState(listing, user);
+}
+
+async function cleanupDeletedListing(listingId) {
+  await Promise.all([
+    Message.deleteMany({ listing: listingId }),
+    Report.deleteMany({ listing: listingId }),
+    Notification.deleteMany({ 'meta.listingId': String(listingId) }),
+  ]);
+}
+
+router.get('/meta/options', async (_req, res) => {
+  const approved = await Listing.find({ status: 'approved', saleStatus: 'available' }).select('category state');
+  const categoryCounts = CATEGORIES.map((name) => ({
+    name,
+    count: approved.filter((item) => item.category === name).length,
+  }));
+  const stateCounts = NIGERIAN_STATES.filter((state) => state !== 'All States').map((name) => ({
+    name,
+    count: approved.filter((item) => item.state === name).length,
+  }));
+  res.json({ categories: categoryCounts, states: stateCounts, disclaimer: SAFETY_DISCLAIMER });
+});
+
+router.get('/featured', async (_req, res) => {
+  const featured = await Listing.find({
+    status: 'approved',
+    saleStatus: 'available',
+    isFeatured: true,
+    premiumPaymentStatus: 'paid',
+    featuredUntil: { $gt: new Date() },
+  })
+    .sort({ featuredUntil: -1, createdAt: -1 })
+    .limit(12)
+    .populate('user', 'name avatar role');
+
+  res.json(featured);
+});
+
+router.get('/mine', auth, async (req, res) => {
+  const listings = await Listing.find({ user: req.user._id }).sort({ createdAt: -1 });
+  res.json(listings);
+});
+
+router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
+  const [
+    pendingListings,
+    reports,
+    unreadNotifications,
+    pendingCount,
+    inboxCount,
+    totalListings,
+    approvedListings,
+    rejectedListings,
+    soldListings,
+    premiumUsers,
+    totalUsers,
+    allListings,
+  ] = await Promise.all([
+    Listing.find({ status: 'pending' }).populate('user', 'name email avatar role').sort({ createdAt: -1 }),
+    Report.find({ status: 'open' }).populate({ path: 'listing', populate: { path: 'user', select: 'name email' } }).sort({ createdAt: -1 }),
+    Notification.countDocuments({ isRead: false }),
+    Listing.countDocuments({ status: 'pending' }),
+    Message.countDocuments(),
+    Listing.countDocuments(),
+    Listing.countDocuments({ status: 'approved' }),
+    Listing.countDocuments({ status: 'rejected' }),
+    Listing.countDocuments({ saleStatus: 'sold' }),
+    User.countDocuments({ premiumStatus: 'active' }),
+    User.countDocuments(),
+    Listing.find().populate('user', 'name email avatar role').sort({ createdAt: -1 }).limit(100),
+  ]);
+
+  res.json({
+    pendingListings,
+    reports,
+    unreadNotifications,
+    pendingCount,
+    inboxCount,
+    totalListings,
+    approvedListings,
+    rejectedListings,
+    soldListings,
+    premiumUsers,
+    totalUsers,
+    allListings,
+  });
+});
+
+router.get('/', async (req, res) => {
+  const {
+    search = '',
+    state,
+    category,
+    sort = 'newest',
+    status = 'approved',
+    saleStatus = 'available',
+  } = req.query;
+
+  const query = {};
+  if (status) query.status = status;
+  if (saleStatus && saleStatus !== 'All') query.saleStatus = saleStatus;
+  if (state && state !== 'All States') query.state = state;
+  if (category && category !== 'All Categories') query.category = category;
+
+  if (search) {
+    query.$or = [
+      { title: { $regex: search, $options: 'i' } },
+      { description: { $regex: search, $options: 'i' } },
+      { city: { $regex: search, $options: 'i' } },
+    ];
+  }
+
+  const listings = await Listing.find(query)
+    .populate('user', 'name avatar role')
+    .sort(getPublicSort(sort));
+
+  res.json(listings);
+});
+
+router.get('/:id', async (req, res) => {
+  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar role premiumStatus premiumExpiresAt');
+  if (!listing) return res.status(404).json({ message: 'Listing not found' });
+  res.json(listing);
+});
+
+router.post('/', auth, upload.array('photos', 4), async (req, res) => {
+  const {
+    title,
+    category,
+    description,
+    state,
+    city,
+    locationLabel,
+    startingPrice,
+    priceLabel,
+    whatsapp,
+    email,
+    phone,
+    safetyAccepted,
+  } = req.body;
+
+  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
+    return res.status(400).json({ message: 'All required fields must be filled' });
+  }
+
+  if (!isValidCategory(category)) {
+    return res.status(400).json({ message: 'Please choose a valid category.' });
+  }
+
+  if (String(safetyAccepted) !== 'true') {
+    return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
+  }
+
+  const photos = toBase64Photos(req.files || []);
+  if (!photos.length) return res.status(400).json({ message: 'At least one photo is required' });
+
+  const scamHit = detectScamText(`${title} ${description}`);
+  const moderationStatus = scamHit ? 'rejected' : 'pending';
+  const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
+
+  const listing = await Listing.create({
+    user: req.user._id,
+    title,
+    category,
+    description,
+    state,
+    city,
+    locationLabel,
+    startingPrice: Number(startingPrice),
+    priceLabel,
+    photos,
+    contact: {
+      whatsapp: sanitizeWhatsapp(whatsapp),
+      email: email || '',
+      phone: phone || '',
+    },
+    status: moderationStatus,
+    rejectionReason,
+    saleStatus: 'available',
+  });
+
+  syncListingPremiumState(listing, req.user);
+  await listing.save();
+
+  await Notification.create({
+    type: 'submission',
+    title: 'New listing submitted',
+    message: `${title} was submitted in ${city}, ${state}`,
+    meta: { listingId: listing._id.toString(), status: moderationStatus, actionUrl: '/admin?tab=pending' },
+  });
+
+  const newListingEmail = buildAdminAlertEmail({
+    title: 'New listing awaiting approval',
+    intro: `A new listing was submitted on ${APP_NAME} and is ready for moderation.`,
+    fields: [
+      { label: 'Title', value: title },
+      { label: 'Seller', value: req.user.name },
+      { label: 'Seller email', value: req.user.email },
+      { label: 'Location', value: `${city}, ${state}` },
+      { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
+      { label: 'Status', value: moderationStatus },
+      { label: 'Submitted', value: formatDateTime(listing.createdAt) },
+    ],
+    actionLabel: 'Review pending listings',
+    footerNote: 'Submitted listings stay pending until you approve them in the admin dashboard.',
+  });
+
+  queueEmail({
+    to: getAdminNotificationRecipients(),
+    subject: `${APP_NAME} listing submitted: ${title}`,
+    html: newListingEmail.html,
+    text: newListingEmail.text,
+  });
+
+  res.status(201).json({ listing, paymentNeeded: false });
+});
+
+router.patch('/:id', auth, upload.array('photos', 4), async (req, res) => {
+  const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
+  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+
+  const {
+    title,
+    category,
+    description,
+    state,
+    city,
+    locationLabel,
+    startingPrice,
+    priceLabel,
+    whatsapp,
+    email,
+    phone,
+    keepPhotos,
+    safetyAccepted,
+  } = req.body;
+
+  const preservedPhotos = parsePhotosField(keepPhotos);
+  const uploadedPhotos = toBase64Photos(req.files || []);
+  const nextPhotos = [...preservedPhotos, ...uploadedPhotos].slice(0, 4);
+
+  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
+    return res.status(400).json({ message: 'All required fields must be filled' });
+  }
+
+  if (!isValidCategory(category)) {
+    return res.status(400).json({ message: 'Please choose a valid category.' });
+  }
+
+  if (String(safetyAccepted) !== 'true') {
+    return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
+  }
+
+  if (!nextPhotos.length) {
+    return res.status(400).json({ message: 'Keep at least one photo or upload a new one.' });
+  }
+
+  const scamHit = detectScamText(`${title} ${description}`);
+  const moderationStatus = scamHit ? 'rejected' : 'pending';
+  const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
+
+  listing.title = title;
+  listing.category = category;
+  listing.description = description;
+  listing.state = state;
+  listing.city = city;
+  listing.locationLabel = locationLabel || '';
+  listing.startingPrice = Number(startingPrice);
+  listing.priceLabel = priceLabel;
+  listing.photos = nextPhotos;
+  listing.contact = {
+    whatsapp: sanitizeWhatsapp(whatsapp),
+    email: email || '',
+    phone: phone || '',
+  };
+  listing.status = moderationStatus;
+  listing.rejectionReason = rejectionReason;
+
+  syncListingPremiumState(listing, req.user);
+  await listing.save();
+  res.json(listing);
+});
+
+router.patch('/:id/sale-status', auth, async (req, res) => {
+  const { saleStatus } = req.body;
+  const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
+  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+
+  if (!['available', 'sold'].includes(saleStatus)) {
+    return res.status(400).json({ message: 'Invalid sale status supplied.' });
+  }
+
+  applySaleStatusEffects(listing, saleStatus, req.user);
+  await listing.save();
+
+  res.json(listing);
+});
+
+router.delete('/:id', auth, async (req, res) => {
+  const listing = await Listing.findOneAndDelete({ _id: req.params.id, user: req.user._id });
+  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
+
+  await cleanupDeletedListing(listing._id);
+  res.json({ message: 'Listing deleted successfully.' });
+});
+
+router.patch('/:id/status', auth, adminOnly, async (req, res) => {
+  const { action, reason } = req.body;
+  const listing = await Listing.findById(req.params.id).populate('user');
+  if (!listing) return res.status(404).json({ message: 'Listing not found' });
+
+  if (action === 'approve') {
+    listing.status = 'approved';
+    listing.rejectionReason = '';
+  } else if (action === 'reject') {
+    if (!reason) return res.status(400).json({ message: 'Rejection reason is required' });
+    listing.status = 'rejected';
+    listing.rejectionReason = reason;
+  } else {
+    return res.status(400).json({ message: 'Invalid action' });
+  }
+
+  syncListingPremiumState(listing, listing.user);
+  await listing.save();
+
+  await Promise.all([
+    Notification.create({
+      type: 'moderation',
+      title: `Listing ${action}d`,
+      message: `${listing.title} has been ${action}d`,
+      meta: { listingId: listing._id.toString(), action, actionUrl: '/admin?tab=all_listings' },
+    }),
+    Notification.create({
+      user: listing.user._id,
+      type: action === 'approve' ? 'listing_approved' : 'listing_rejected',
+      title: action === 'approve' ? 'Your listing was approved' : 'Your listing was rejected',
+      message:
+        action === 'approve'
+          ? `${listing.title} is now live on ${APP_NAME}.`
+          : `${listing.title} was rejected${reason ? `: ${reason}` : '.'}`, 
+      meta: {
+        listingId: listing._id.toString(),
+        action,
+        reason: reason || '',
+        actionUrl: `/listings/${listing._id.toString()}`, 
+      },
+    }),
+  ]);
+
+  res.json(listing);
+});
+
+router.post('/:id/reviews', auth, async (req, res) => {
+  const { rating, comment } = req.body;
+  if (!rating || !comment) return res.status(400).json({ message: 'Rating and comment are required' });
+  const listing = await Listing.findById(req.params.id);
+  if (!listing) return res.status(404).json({ message: 'Listing not found' });
+
+  if (listing.user.toString() === req.user._id.toString()) {
+    return res.status(400).json({ message: 'You cannot review or rate your own listing.' });
+  }
+
+  const existing = listing.reviews.find((review) => review.user?.toString() === req.user._id.toString());
+  if (existing) return res.status(400).json({ message: 'You already reviewed this listing' });
+
+  listing.reviews.push({
+    user: req.user._id,
+    name: req.user.name,
+    rating: Number(rating),
+    comment,
+  });
+  updateRatingStats(listing);
+  await listing.save();
+
+  await Notification.create({
+    user: listing.user,
+    type: 'review',
+    title: 'New review on your listing',
+    message: `${req.user.name} left a ${Number(rating)}/5 review on ${listing.title}.`,
+    meta: {
+      listingId: listing._id.toString(),
+      reviewerId: req.user._id.toString(),
+      actionUrl: `/listings/${listing._id.toString()}`, 
+    },
+  });
+
+  res.status(201).json(listing);
+});
+
+router.post('/:id/report', optionalAuth, async (req, res) => {
+  const { reporterName, reporterEmail, reason } = req.body;
+  if (!reporterName || !reason) return res.status(400).json({ message: 'Reporter name and reason are required' });
+  const listing = await Listing.findById(req.params.id);
+  if (!listing) return res.status(404).json({ message: 'Listing not found' });
+
+  if (req.user && listing.user.toString() === req.user._id.toString()) {
+    return res.status(400).json({ message: 'You cannot report your own listing.' });
+  }
+
+  const report = await Report.create({
+    listing: listing._id,
+    reporterName,
+    reporterEmail,
+    reason,
+  });
+
+  await Notification.create({
+    type: 'report',
+    title: 'Listing reported',
+    message: `${listing.title} was reported by ${reporterName}`,
+    meta: { listingId: listing._id.toString(), reportId: report._id.toString(), actionUrl: '/admin?tab=reports' },
+  });
+
+  const reportEmail = buildAdminAlertEmail({
+    title: 'Listing reported for review',
+    intro: `${reporterName} reported a listing on ${APP_NAME}.`,
+    fields: [
+      { label: 'Listing', value: listing.title },
+      { label: 'Reporter', value: reporterName },
+      { label: 'Reporter email', value: reporterEmail || 'Not provided' },
+      { label: 'Reason', value: reason },
+      { label: 'Reported', value: formatDateTime(report.createdAt) },
+    ],
+    actionLabel: 'Review reports',
+    footerNote: 'This notification goes only to the configured PeezuHub admin inbox.',
+  });
+
+  queueEmail({
+    to: getAdminNotificationRecipients(),
+    subject: `${APP_NAME} report: ${listing.title}`,
+    html: reportEmail.html,
+    text: reportEmail.text,
+  });
+
+  res.status(201).json({ message: 'Report sent to admin successfully' });
+});
+
+module.exports = router;
