@@ -1,10 +1,14 @@
 'use strict';
 /**
- * PeezuHub – resilient email delivery for Render + Gmail
- * ------------------------------------------------------
- * Strategy order:
- * 1) Gmail API over HTTPS (best for Render free instances because SMTP ports can be blocked)
- * 2) SMTP via Nodemailer with explicit Gmail host/port fallback
+ * PeezuHub – email delivery with Courier restored as the default transport.
+ * ----------------------------------------------------------------------
+ * Delivery priority:
+ * 1) Courier Send API (when COURIER_API_KEY is present)
+ * 2) Gmail API (only when Courier is not configured and Google OAuth vars exist)
+ * 3) SMTP via Nodemailer (only when Courier is not configured and SMTP vars exist)
+ *
+ * This restores the older Render-friendly setup where admin emails can be sent
+ * through Courier without requiring direct SMTP connectivity from Render.
  */
 
 const axios = require('axios');
@@ -74,6 +78,7 @@ function extractEmailAddress(value = '') {
 
 function getSenderEmail() {
   return (
+    extractEmailAddress(process.env.COURIER_FROM_EMAIL) ||
     extractEmailAddress(process.env.GMAIL_SENDER_EMAIL) ||
     extractEmailAddress(process.env.SMTP_FROM) ||
     extractEmailAddress(process.env.SMTP_USER)
@@ -81,19 +86,46 @@ function getSenderEmail() {
 }
 
 function getFromAddress() {
+  const explicitFrom = String(process.env.COURIER_FROM_EMAIL || '').trim();
+  if (explicitFrom) return explicitFrom;
+
   const senderEmail = getSenderEmail();
   if (!senderEmail) return undefined;
   return `${getMailBrandName()} <${senderEmail}>`;
+}
+
+function getReplyToAddress(overrideValue = '') {
+  return (
+    String(overrideValue || '').trim() ||
+    String(process.env.COURIER_REPLY_TO || '').trim() ||
+    String(process.env.MAIL_REPLY_TO || '').trim() ||
+    undefined
+  );
 }
 
 function isLikelyGmailAddress(value = '') {
   return String(value).trim().toLowerCase().endsWith('@gmail.com');
 }
 
-function shouldUseGmailApi() {
-  const mode = String(process.env.EMAIL_DELIVERY_MODE || process.env.MAIL_DELIVERY_MODE || 'auto')
+function getDeliveryMode() {
+  return String(process.env.EMAIL_DELIVERY_MODE || process.env.MAIL_DELIVERY_MODE || 'auto')
     .trim()
     .toLowerCase();
+}
+
+function hasCourierConfig() {
+  return Boolean(String(process.env.COURIER_API_KEY || '').trim());
+}
+
+function shouldUseCourier() {
+  const mode = getDeliveryMode();
+  if (mode === 'courier') return hasCourierConfig();
+  if (mode === 'gmail_api' || mode === 'smtp') return false;
+  return hasCourierConfig();
+}
+
+function shouldUseGmailApi() {
+  const mode = getDeliveryMode();
 
   const hasOauthConfig = Boolean(
     process.env.GOOGLE_CLIENT_ID?.trim() &&
@@ -102,8 +134,10 @@ function shouldUseGmailApi() {
       getSenderEmail()
   );
 
+  if (mode === 'courier') return false;
   if (mode === 'gmail_api') return hasOauthConfig;
   if (mode === 'smtp') return false;
+  if (hasCourierConfig()) return false;
   return hasOauthConfig;
 }
 
@@ -158,6 +192,65 @@ function buildMimeMessage({ from, to, cc, bcc, replyTo, subject, html, text }) {
   ].filter(Boolean);
 
   return lines.join('\r\n');
+}
+
+async function sendViaCourier(mailOptions) {
+  const apiKey = String(process.env.COURIER_API_KEY || '').trim();
+  if (!apiKey) {
+    console.warn('[PeezuHub] Courier not configured - COURIER_API_KEY is missing.');
+    return false;
+  }
+
+  const toList = normalizeRecipients(mailOptions.to);
+  const ccList = normalizeRecipients(mailOptions.cc);
+  const bccList = normalizeRecipients(mailOptions.bcc);
+  const from = mailOptions.from || getFromAddress();
+  const replyTo = getReplyToAddress(mailOptions.replyTo);
+  const text = mailOptions.text || stripHtml(mailOptions.html || '');
+
+  if (!toList.length) {
+    console.warn('[PeezuHub] Courier send skipped: no recipient.');
+    return false;
+  }
+
+  const payload = {
+    message: {
+      to: toList.length === 1 ? { email: toList[0] } : toList.map((email) => ({ email })),
+      routing: {
+        method: 'single',
+        channels: ['email'],
+      },
+      content: {
+        title: mailOptions.subject,
+        body: text || mailOptions.subject,
+      },
+      channels: {
+        email: {
+          override: {
+            subject: mailOptions.subject,
+            html: mailOptions.html,
+            text,
+            ...(from ? { from } : {}),
+            ...(replyTo ? { reply_to: replyTo } : {}),
+            ...(ccList.length ? { cc: ccList.join(', ') } : {}),
+            ...(bccList.length ? { bcc: bccList.join(', ') } : {}),
+          },
+        },
+      },
+    },
+  };
+
+  const response = await axios.post('https://api.courier.com/send', payload, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 20_000,
+  });
+
+  const requestId = response?.data?.requestId || response?.data?.messageId || 'unknown-request-id';
+  console.log(`[PeezuHub] Email sent via Courier -> ${toList.join(', ')} | ${mailOptions.subject} | requestId=${requestId}`);
+  return true;
 }
 
 async function getGmailApiAccessToken() {
@@ -348,7 +441,7 @@ function explainPossibleRenderBlock(error) {
   if (!isRender) return '';
   if (!['ETIMEDOUT', 'ECONNECTION', 'ESOCKET'].includes(code) && !message.includes('timeout')) return '';
 
-  return ' Render commonly blocks outbound SMTP on free web services; switch EMAIL_DELIVERY_MODE to gmail_api with GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN, or upgrade the instance before relying on Gmail SMTP.';
+  return ' Render commonly blocks outbound SMTP on free web services; prefer Courier with COURIER_API_KEY / COURIER_FROM_EMAIL / COURIER_REPLY_TO or use Gmail API OAuth instead of raw SMTP.';
 }
 
 async function sendViaSmtp(mailOptions) {
@@ -404,11 +497,20 @@ async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
     to: toList.join(', '),
     cc: ccList.length ? ccList.join(', ') : undefined,
     bcc: bccList.length ? bccList.join(', ') : undefined,
-    replyTo: replyTo || undefined,
+    replyTo: getReplyToAddress(replyTo),
     subject,
     html,
     text: text || stripHtml(html),
   };
+
+  if (shouldUseCourier()) {
+    try {
+      return await sendViaCourier(mailOptions);
+    } catch (error) {
+      console.error(`[PeezuHub] Courier delivery failed (${subject}): ${error.message}`);
+      return false;
+    }
+  }
 
   if (shouldUseGmailApi()) {
     try {
@@ -417,6 +519,7 @@ async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
       return true;
     } catch (error) {
       console.error(`[PeezuHub] Gmail API delivery failed (${subject}): ${error.message}`);
+      return false;
     }
   }
 
