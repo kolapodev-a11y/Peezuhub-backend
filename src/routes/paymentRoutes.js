@@ -123,9 +123,6 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
           userId: user._id.toString(),
           plan: 'seller_premium',
           appliesTo: 'all_current_and_future_listings',
-          sourceApp: APP_NAME,
-          sourceAppSlug: 'peezuhub',
-          transactionKind: 'seller_premium_upgrade',
         },
       },
       {
@@ -143,12 +140,21 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
     user.premiumAmount = PREMIUM_PRICE_NAIRA;
     await user.save();
 
-    await Notification.create({
-      type: 'premium_upgrade_pending',
-      title: 'Premium upgrade initiated',
-      message: `${user.name} started a seller premium upgrade payment.`,
-      meta: { userId: user._id.toString(), reference, actionUrl: '/admin?tab=notifications' },
-    });
+    await Promise.all([
+      Notification.create({
+        type: 'premium_upgrade_pending',
+        title: 'Premium upgrade initiated',
+        message: `${user.name} started a seller premium upgrade payment.`,
+        meta: { userId: user._id.toString(), reference, path: '/admin?tab=notifications&filter=premium' },
+      }),
+      Notification.create({
+        user: user._id,
+        type: 'premium_user_pending',
+        title: 'Premium upgrade started',
+        message: 'Your seller premium payment has started. We will activate it immediately after Paystack confirms the payment.',
+        meta: { reference, path: '/profile?tab=notifications' },
+      }),
+    ]);
 
     res.json({ authorizationUrl: response.data.data.authorization_url, reference });
   } catch (err) {
@@ -256,18 +262,18 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
               userId: user._id.toString(),
               reference,
               expiresAt: expiresAt.toISOString(),
-              actionUrl: '/admin?tab=notifications',
+              path: '/admin?tab=notifications&filter=premium',
             },
           }),
           Notification.create({
             user: user._id,
-            type: 'premium_active',
+            type: 'premium_user_active',
             title: 'Seller premium is active',
-            message: `Your seller premium upgrade is now active until ${expiresAt.toLocaleDateString('en-NG')}.`,
+            message: `Your seller premium is active until ${expiresAt.toLocaleDateString('en-NG')}. Current and future listings can now receive premium treatment.`,
             meta: {
               reference,
               expiresAt: expiresAt.toISOString(),
-              actionUrl: '/profile?tab=notifications',
+              path: '/profile?tab=notifications',
             },
           }),
         ]);

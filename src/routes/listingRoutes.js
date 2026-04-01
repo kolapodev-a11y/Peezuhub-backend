@@ -110,6 +110,12 @@ async function cleanupDeletedListing(listingId) {
   ]);
 }
 
+function buildAdminNotificationScope(adminUserId) {
+  return {
+    $or: [{ user: adminUserId }, { user: null }, { user: { $exists: false } }],
+  };
+}
+
 router.get('/meta/options', async (_req, res) => {
   const approved = await Listing.find({ status: 'approved', saleStatus: 'available' }).select('category state');
   const categoryCounts = CATEGORIES.map((name) => ({
@@ -159,8 +165,8 @@ router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
     allListings,
   ] = await Promise.all([
     Listing.find({ status: 'pending' }).populate('user', 'name email avatar role').sort({ createdAt: -1 }),
-    Report.find({ status: 'open' }).populate({ path: 'listing', populate: { path: 'user', select: 'name email' } }).sort({ createdAt: -1 }),
-    Notification.countDocuments({ isRead: false }),
+    Report.find({ status: 'open' }).populate({ path: 'listing', populate: { path: 'user', select: 'name email role' } }).sort({ createdAt: -1 }),
+    Notification.countDocuments({ ...buildAdminNotificationScope(_req.user._id), isRead: false }),
     Listing.countDocuments({ status: 'pending' }),
     Message.countDocuments(),
     Listing.countDocuments(),
@@ -220,7 +226,7 @@ router.get('/', async (req, res) => {
 });
 
 router.get('/:id', async (req, res) => {
-  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar role premiumStatus premiumExpiresAt');
+  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar premiumStatus premiumExpiresAt role');
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
   res.json(listing);
 });
@@ -288,7 +294,11 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     type: 'submission',
     title: 'New listing submitted',
     message: `${title} was submitted in ${city}, ${state}`,
-    meta: { listingId: listing._id.toString(), status: moderationStatus, actionUrl: '/admin?tab=pending' },
+    meta: {
+      listingId: listing._id.toString(),
+      status: moderationStatus,
+      path: '/admin?tab=pending',
+    },
   });
 
   const newListingEmail = buildAdminAlertEmail({
@@ -425,29 +435,21 @@ router.patch('/:id/status', auth, adminOnly, async (req, res) => {
   syncListingPremiumState(listing, listing.user);
   await listing.save();
 
-  await Promise.all([
-    Notification.create({
-      type: 'moderation',
-      title: `Listing ${action}d`,
-      message: `${listing.title} has been ${action}d`,
-      meta: { listingId: listing._id.toString(), action, actionUrl: '/admin?tab=all_listings' },
-    }),
-    Notification.create({
-      user: listing.user._id,
-      type: action === 'approve' ? 'listing_approved' : 'listing_rejected',
-      title: action === 'approve' ? 'Your listing was approved' : 'Your listing was rejected',
-      message:
-        action === 'approve'
-          ? `${listing.title} is now live on ${APP_NAME}.`
-          : `${listing.title} was rejected${reason ? `: ${reason}` : '.'}`, 
-      meta: {
-        listingId: listing._id.toString(),
-        action,
-        reason: reason || '',
-        actionUrl: `/listings/${listing._id.toString()}`, 
-      },
-    }),
-  ]);
+  await Notification.create({
+    user: listing.user?._id,
+    type: action === 'approve' ? 'moderation_approved' : 'moderation_rejected',
+    title: action === 'approve' ? 'Listing approved' : 'Listing rejected',
+    message:
+      action === 'approve'
+        ? `${listing.title} has been approved and is now visible to buyers.`
+        : `${listing.title} was rejected${reason ? `: ${reason}` : '.'}`,
+    meta: {
+      listingId: listing._id.toString(),
+      action,
+      reason: reason || '',
+      path: `/listings/${listing._id.toString()}`,
+    },
+  });
 
   res.json(listing);
 });
@@ -477,12 +479,13 @@ router.post('/:id/reviews', auth, async (req, res) => {
   await Notification.create({
     user: listing.user,
     type: 'review',
-    title: 'New review on your listing',
-    message: `${req.user.name} left a ${Number(rating)}/5 review on ${listing.title}.`,
+    title: 'New review received',
+    message: `${req.user.name} left a ${Number(rating)}-star review on ${listing.title}.`,
     meta: {
       listingId: listing._id.toString(),
       reviewerId: req.user._id.toString(),
-      actionUrl: `/listings/${listing._id.toString()}`, 
+      rating: Number(rating),
+      path: `/listings/${listing._id.toString()}`,
     },
   });
 
@@ -510,7 +513,11 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
     type: 'report',
     title: 'Listing reported',
     message: `${listing.title} was reported by ${reporterName}`,
-    meta: { listingId: listing._id.toString(), reportId: report._id.toString(), actionUrl: '/admin?tab=reports' },
+    meta: {
+      listingId: listing._id.toString(),
+      reportId: report._id.toString(),
+      path: '/admin?tab=reports',
+    },
   });
 
   const reportEmail = buildAdminAlertEmail({
