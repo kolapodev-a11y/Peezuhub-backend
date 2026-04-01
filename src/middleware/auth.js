@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { syncUserRoleFromAdminEmails } = require('../utils/authRole');
 
 async function resolveUserFromHeader(header = '') {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -8,7 +9,10 @@ async function resolveUserFromHeader(header = '') {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id).select('-passwordHash');
-    return user || null;
+    if (!user) return null;
+
+    await syncUserRoleFromAdminEmails(user);
+    return user;
   } catch {
     return null;
   }
