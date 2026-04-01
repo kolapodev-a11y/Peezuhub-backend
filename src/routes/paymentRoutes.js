@@ -215,19 +215,21 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
 
       if (shouldDispatchEmails) {
         const adminEmail = buildAdminAlertEmail({
-          title: 'Premium upgrade payment received',
-          intro: `${user.name} completed a seller premium payment on ${APP_NAME}.`,
+          variant: 'premium_upgrade',
+          eyebrow: 'Premium upgrade paid',
+          title: 'A seller premium payment was completed',
+          intro: 'A user successfully completed a premium upgrade. Their current and future listings should now receive premium treatment until the expiry date.',
           fields: [
-            { label: 'Member', value: user.name },
-            { label: 'Email', value: user.email },
+            { label: 'User name', value: user.name },
+            { label: 'User email', value: user.email },
+            { label: 'Plan', value: 'Seller premium (all current and future listings)' },
             { label: 'Reference', value: reference },
-            { label: 'Amount', value: `₦${PREMIUM_PRICE_NAIRA.toLocaleString('en-NG')}` },
-            { label: 'Plan', value: 'Seller premium (all current & future listings)' },
-            { label: 'Activated', value: formatDateTime(activatedAt) },
             { label: 'Expires', value: formatDateTime(expiresAt) },
+            { label: 'Paid at', value: formatDateTime(activatedAt) },
           ],
           actionLabel: 'Open admin dashboard',
-          footerNote: `This alert is sent only once per successful ${APP_NAME} premium payment reference.`,
+          callout: 'You can verify the account status in the admin dashboard and confirm that listing badges and top placement are active.',
+          footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
         });
 
         queueEmail({

@@ -302,19 +302,23 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
   });
 
   const newListingEmail = buildAdminAlertEmail({
-    title: 'New listing awaiting approval',
-    intro: `A new listing was submitted on ${APP_NAME} and is ready for moderation.`,
+    variant: 'listing_approval',
+    eyebrow: 'New listing submitted',
+    title: 'A new listing needs moderation',
+    intro: `A user just submitted a listing on ${APP_NAME}. Review it in the admin dashboard and decide whether to approve or reject it.`,
     fields: [
-      { label: 'Title', value: title },
-      { label: 'Seller', value: req.user.name },
-      { label: 'Seller email', value: req.user.email },
+      { label: 'Listing title', value: title },
+      { label: 'Category', value: category },
       { label: 'Location', value: `${city}, ${state}` },
       { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
-      { label: 'Status', value: moderationStatus },
-      { label: 'Submitted', value: formatDateTime(listing.createdAt) },
+      { label: 'Seller', value: req.user.name },
+      { label: 'Seller email', value: req.user.email },
+      { label: 'Moderation status', value: moderationStatus },
+      { label: 'Submitted at', value: formatDateTime(listing.createdAt) },
     ],
-    actionLabel: 'Review pending listings',
-    footerNote: 'Submitted listings stay pending until you approve them in the admin dashboard.',
+    actionLabel: 'Open admin dashboard',
+    callout: 'Open the admin dashboard to verify the content, inspect the photos and take moderation action quickly.',
+    footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
   });
 
   queueEmail({
@@ -521,17 +525,22 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
   });
 
   const reportEmail = buildAdminAlertEmail({
-    title: 'Listing reported for review',
-    intro: `${reporterName} reported a listing on ${APP_NAME}.`,
+    variant: 'listing_report',
+    eyebrow: 'Listing reported',
+    title: 'A listing was reported by a user',
+    intro: 'A visitor flagged a listing for admin attention. Please inspect the listing details and decide whether additional moderation is required.',
     fields: [
-      { label: 'Listing', value: listing.title },
+      { label: 'Listing title', value: listing.title },
+      { label: 'Category', value: listing.category },
+      { label: 'Listing owner ID', value: listing.user?.toString?.() || String(listing.user || '') },
       { label: 'Reporter', value: reporterName },
       { label: 'Reporter email', value: reporterEmail || 'Not provided' },
       { label: 'Reason', value: reason },
-      { label: 'Reported', value: formatDateTime(report.createdAt) },
+      { label: 'Reported at', value: formatDateTime(report.createdAt) },
     ],
-    actionLabel: 'Review reports',
-    footerNote: 'This notification goes only to the configured PeezuHub admin inbox.',
+    actionLabel: 'Review admin dashboard',
+    callout: 'Reports can indicate fraud, spam, duplicate content or unsafe buyer/seller behaviour. Review promptly.',
+    footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
   });
 
   queueEmail({
