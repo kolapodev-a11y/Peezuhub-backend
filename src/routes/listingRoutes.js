@@ -4,17 +4,13 @@ const Listing = require('../models/Listing');
 const Report = require('../models/Report');
 const Notification = require('../models/Notification');
 const Message = require('../models/Message');
-const User = require('../models/User');
 const { auth, optionalAuth, adminOnly } = require('../middleware/auth');
 const { detectScamText } = require('../utils/scamCheck');
 const { NIGERIAN_STATES, CATEGORIES, SAFETY_DISCLAIMER } = require('../utils/constants');
-const { queueEmail } = require('../utils/sendEmail');
 const {
-  APP_NAME,
-  buildAdminAlertEmail,
-  formatDateTime,
-  getAdminNotificationRecipients,
-} = require('../utils/emailTemplates');
+  sendAdminListingReportedEmail,
+  sendAdminListingSubmittedEmail,
+} = require('../utils/sendEmail');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
@@ -133,7 +129,7 @@ router.get('/featured', async (_req, res) => {
   })
     .sort({ featuredUntil: -1, createdAt: -1 })
     .limit(12)
-    .populate('user', 'name avatar role');
+    .populate('user', 'name avatar');
 
   res.json(featured);
 });
@@ -144,48 +140,12 @@ router.get('/mine', auth, async (req, res) => {
 });
 
 router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
-  const [
-    pendingListings,
-    reports,
-    unreadNotifications,
-    pendingCount,
-    inboxCount,
-    totalListings,
-    approvedListings,
-    rejectedListings,
-    soldListings,
-    premiumUsers,
-    totalUsers,
-    allListings,
-  ] = await Promise.all([
-    Listing.find({ status: 'pending' }).populate('user', 'name email avatar role').sort({ createdAt: -1 }),
-    Report.find({ status: 'open' }).populate({ path: 'listing', populate: { path: 'user', select: 'name email' } }).sort({ createdAt: -1 }),
-    Notification.countDocuments({ isRead: false }),
-    Listing.countDocuments({ status: 'pending' }),
-    Message.countDocuments(),
-    Listing.countDocuments(),
-    Listing.countDocuments({ status: 'approved' }),
-    Listing.countDocuments({ status: 'rejected' }),
-    Listing.countDocuments({ saleStatus: 'sold' }),
-    User.countDocuments({ premiumStatus: 'active' }),
-    User.countDocuments(),
-    Listing.find().populate('user', 'name email avatar role').sort({ createdAt: -1 }).limit(100),
-  ]);
-
-  res.json({
-    pendingListings,
-    reports,
-    unreadNotifications,
-    pendingCount,
-    inboxCount,
-    totalListings,
-    approvedListings,
-    rejectedListings,
-    soldListings,
-    premiumUsers,
-    totalUsers,
-    allListings,
-  });
+  const pendingListings = await Listing.find({ status: 'pending' }).populate('user', 'name email').sort({ createdAt: -1 });
+  const reports = await Report.find({ status: 'open' }).populate('listing').sort({ createdAt: -1 });
+  const unreadNotifications = await Notification.countDocuments({ isRead: false });
+  const pendingCount = await Listing.countDocuments({ status: 'pending' });
+  const inboxCount = await Message.countDocuments();
+  res.json({ pendingListings, reports, unreadNotifications, pendingCount, inboxCount });
 });
 
 router.get('/', async (req, res) => {
@@ -213,14 +173,14 @@ router.get('/', async (req, res) => {
   }
 
   const listings = await Listing.find(query)
-    .populate('user', 'name avatar role')
+    .populate('user', 'name avatar')
     .sort(getPublicSort(sort));
 
   res.json(listings);
 });
 
 router.get('/:id', async (req, res) => {
-  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar role premiumStatus premiumExpiresAt');
+  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar premiumStatus premiumExpiresAt');
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
   res.json(listing);
 });
@@ -288,30 +248,13 @@ router.post('/', auth, upload.array('photos', 4), async (req, res) => {
     type: 'submission',
     title: 'New listing submitted',
     message: `${title} was submitted in ${city}, ${state}`,
-    meta: { listingId: listing._id.toString(), status: moderationStatus, actionUrl: '/admin?tab=pending' },
+    meta: { listingId: listing._id.toString(), status: moderationStatus },
   });
 
-  const newListingEmail = buildAdminAlertEmail({
-    title: 'New listing awaiting approval',
-    intro: `A new listing was submitted on ${APP_NAME} and is ready for moderation.`,
-    fields: [
-      { label: 'Title', value: title },
-      { label: 'Seller', value: req.user.name },
-      { label: 'Seller email', value: req.user.email },
-      { label: 'Location', value: `${city}, ${state}` },
-      { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
-      { label: 'Status', value: moderationStatus },
-      { label: 'Submitted', value: formatDateTime(listing.createdAt) },
-    ],
-    actionLabel: 'Review pending listings',
-    footerNote: 'Submitted listings stay pending until you approve them in the admin dashboard.',
-  });
-
-  queueEmail({
-    to: getAdminNotificationRecipients(),
-    subject: `${APP_NAME} listing submitted: ${title}`,
-    html: newListingEmail.html,
-    text: newListingEmail.text,
+  await sendAdminListingSubmittedEmail({
+    listing,
+    ownerName: req.user.name,
+    ownerEmail: req.user.email,
   });
 
   res.status(201).json({ listing, paymentNeeded: false });
@@ -425,29 +368,12 @@ router.patch('/:id/status', auth, adminOnly, async (req, res) => {
   syncListingPremiumState(listing, listing.user);
   await listing.save();
 
-  await Promise.all([
-    Notification.create({
-      type: 'moderation',
-      title: `Listing ${action}d`,
-      message: `${listing.title} has been ${action}d`,
-      meta: { listingId: listing._id.toString(), action, actionUrl: '/admin?tab=all_listings' },
-    }),
-    Notification.create({
-      user: listing.user._id,
-      type: action === 'approve' ? 'listing_approved' : 'listing_rejected',
-      title: action === 'approve' ? 'Your listing was approved' : 'Your listing was rejected',
-      message:
-        action === 'approve'
-          ? `${listing.title} is now live on ${APP_NAME}.`
-          : `${listing.title} was rejected${reason ? `: ${reason}` : '.'}`, 
-      meta: {
-        listingId: listing._id.toString(),
-        action,
-        reason: reason || '',
-        actionUrl: `/listings/${listing._id.toString()}`, 
-      },
-    }),
-  ]);
+  await Notification.create({
+    type: 'moderation',
+    title: `Listing ${action}d`,
+    message: `${listing.title} has been ${action}d`,
+    meta: { listingId: listing._id.toString(), action },
+  });
 
   res.json(listing);
 });
@@ -474,18 +400,6 @@ router.post('/:id/reviews', auth, async (req, res) => {
   updateRatingStats(listing);
   await listing.save();
 
-  await Notification.create({
-    user: listing.user,
-    type: 'review',
-    title: 'New review on your listing',
-    message: `${req.user.name} left a ${Number(rating)}/5 review on ${listing.title}.`,
-    meta: {
-      listingId: listing._id.toString(),
-      reviewerId: req.user._id.toString(),
-      actionUrl: `/listings/${listing._id.toString()}`, 
-    },
-  });
-
   res.status(201).json(listing);
 });
 
@@ -510,28 +424,14 @@ router.post('/:id/report', optionalAuth, async (req, res) => {
     type: 'report',
     title: 'Listing reported',
     message: `${listing.title} was reported by ${reporterName}`,
-    meta: { listingId: listing._id.toString(), reportId: report._id.toString(), actionUrl: '/admin?tab=reports' },
+    meta: { listingId: listing._id.toString(), reportId: report._id.toString() },
   });
 
-  const reportEmail = buildAdminAlertEmail({
-    title: 'Listing reported for review',
-    intro: `${reporterName} reported a listing on ${APP_NAME}.`,
-    fields: [
-      { label: 'Listing', value: listing.title },
-      { label: 'Reporter', value: reporterName },
-      { label: 'Reporter email', value: reporterEmail || 'Not provided' },
-      { label: 'Reason', value: reason },
-      { label: 'Reported', value: formatDateTime(report.createdAt) },
-    ],
-    actionLabel: 'Review reports',
-    footerNote: 'This notification goes only to the configured PeezuHub admin inbox.',
-  });
-
-  queueEmail({
-    to: getAdminNotificationRecipients(),
-    subject: `${APP_NAME} report: ${listing.title}`,
-    html: reportEmail.html,
-    text: reportEmail.text,
+  await sendAdminListingReportedEmail({
+    listing,
+    reporterName,
+    reporterEmail,
+    reason,
   });
 
   res.status(201).json({ message: 'Report sent to admin successfully' });
