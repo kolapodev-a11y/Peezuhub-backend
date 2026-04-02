@@ -1,29 +1,31 @@
 'use strict';
 /**
- * PeezuHub – email delivery via Courier
+ * PeezuHub – email delivery via Resend
  * =====================================
- * Restores the original Courier-first delivery flow and keeps the existing
- * sendEmail / queueEmail interface unchanged so the current email templates
- * and calling code continue to work without modification.
+ * Single, clean transport: Resend API (https://resend.com)
  *
- * Required env vars:
- *   COURIER_API_KEY      - Courier production API key
+ * Required env var:
+ *   RESEND_API_KEY       – your Resend secret key (re_xxxxxxxxxxxxxxxx)
  *
  * Optional env vars:
- *   COURIER_FROM_EMAIL   - full From address, e.g. "PeezuHub <peezutech@gmail.com>"
- *   COURIER_REPLY_TO     - reply-to address
- *   MAIL_APP_NAME        - brand name used in logs (fallbacks: PEEZUHUB_APP_NAME, APP_NAME)
- *   APP_NAME             - app name fallback
+ *   RESEND_FROM_EMAIL    – full "From" address, e.g. "PeezuHub <hello@yourdomain.com>"
+ *                          If omitted the Resend test sender is used (good for dev only).
+ *   RESEND_REPLY_TO      – reply-to address, e.g. "support@yourdomain.com"
+ *   MAIL_APP_NAME        – brand name used in log messages (falls back to APP_NAME)
+ *   APP_NAME             – application name (default "PeezuHub")
  *
- * Exports (interface preserved):
- *   sendEmail({ to, cc, bcc, subject, html, text, replyTo }) -> Promise<boolean>
- *   queueEmail(payload)                                      -> true
- *   normalizeRecipients(value)                               -> string[]
+ * Exports (interface unchanged – all callers work without modification):
+ *   sendEmail({ to, cc, bcc, subject, html, text, replyTo }) → Promise<boolean>
+ *   queueEmail(payload)                                       → true  (fire-and-forget)
+ *   normalizeRecipients(value)                                → string[]
+ *
+ * Email templates (src/utils/emailTemplates.js) are NOT touched – they remain
+ * exactly as they were.
  */
 
-const axios = require('axios');
+const { Resend } = require('resend');
 
-const COURIER_SEND_URL = 'https://api.courier.com/send';
+// ─── helpers ─────────────────────────────────────────────────────────────────
 
 function getMailBrandName() {
   return (
@@ -34,6 +36,10 @@ function getMailBrandName() {
   );
 }
 
+/**
+ * Accepts a comma-separated string, a single email address, or an array.
+ * Returns a de-duplicated array of trimmed address strings.
+ */
 function normalizeRecipients(value) {
   if (!value) return [];
 
@@ -47,123 +53,119 @@ function normalizeRecipients(value) {
   return [...new Set(items.map((s) => String(s).trim()).filter(Boolean))];
 }
 
+/** Strip HTML tags to produce a plain-text fallback. */
 function stripHtml(html = '') {
   return String(html)
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&#39;/gi, "'")
-    .replace(/&quot;/gi, '"')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+/**
+ * Resolve the "from" address.
+ * In production set RESEND_FROM_EMAIL to a verified domain sender, e.g.:
+ *   RESEND_FROM_EMAIL=PeezuHub <noreply@peezuhub.name.ng>
+ */
 function getFromAddress() {
   return (
-    process.env.COURIER_FROM_EMAIL?.trim() ||
-    `${getMailBrandName()} <no-reply@peezuhub.local>`
+    process.env.RESEND_FROM_EMAIL?.trim() ||
+    `${getMailBrandName()} <onboarding@resend.dev>`
   );
 }
 
 function getReplyTo(overrideValue = '') {
   const resolved =
     String(overrideValue || '').trim() ||
-    String(process.env.COURIER_REPLY_TO || '').trim();
+    String(process.env.RESEND_REPLY_TO || '').trim();
   return resolved || undefined;
 }
 
-function getCourierApiKey() {
-  const apiKey = String(process.env.COURIER_API_KEY || '').trim();
+/** Create and return a Resend client, throwing if the key is missing. */
+function createResendClient() {
+  const apiKey = String(process.env.RESEND_API_KEY || '').trim();
   if (!apiKey) {
     throw new Error(
-      '[PeezuHub] COURIER_API_KEY is not configured. Add it to your Render environment variables.'
+      '[PeezuHub] RESEND_API_KEY is not configured. ' +
+        'Add it to your .env / Render environment variables.'
     );
   }
-  return apiKey;
+  return new Resend(apiKey);
 }
 
-async function sendCourierMessage({ recipient, ccList, bccList, subject, html, text, replyTo }) {
-  const apiKey = getCourierApiKey();
+// ─── core send function ───────────────────────────────────────────────────────
 
-  const override = {
-    subject,
-    html,
-    text: text || stripHtml(html),
-    from: getFromAddress(),
-  };
-
-  const resolvedReplyTo = getReplyTo(replyTo);
-  if (resolvedReplyTo) override.reply_to = resolvedReplyTo;
-  if (ccList.length) override.cc = ccList.join(',');
-  if (bccList.length) override.bcc = bccList.join(',');
-
-  const payload = {
-    message: {
-      to: { email: recipient },
-      content: {
-        title: subject,
-        body: override.text,
-      },
-      channels: {
-        email: {
-          override,
-        },
-      },
-    },
-  };
-
-  const response = await axios.post(COURIER_SEND_URL, payload, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 30000,
-  });
-
-  return response?.data?.requestId;
-}
-
+/**
+ * Send a single email through Resend.
+ *
+ * @param {{ to, cc, bcc, subject, html, text, replyTo }} options
+ * @returns {Promise<boolean>} true on success, false on any failure
+ */
 async function sendEmail({ to, cc, bcc, subject, html, text, replyTo }) {
-  const toList = normalizeRecipients(to);
-  const ccList = normalizeRecipients(cc);
+  const toList  = normalizeRecipients(to);
+  const ccList  = normalizeRecipients(cc);
   const bccList = normalizeRecipients(bcc);
 
   if (!toList.length || !subject || !html) {
-    console.warn('[PeezuHub] sendEmail skipped: missing recipient, subject or html body.');
+    console.warn(
+      '[PeezuHub] sendEmail skipped: missing recipient, subject or html body.'
+    );
     return false;
   }
 
+  let resend;
   try {
-    const results = await Promise.all(
-      toList.map((recipient) =>
-        sendCourierMessage({
-          recipient,
-          ccList,
-          bccList,
-          subject,
-          html,
-          text,
-          replyTo,
-        })
-      )
-    );
+    resend = createResendClient();
+  } catch (err) {
+    console.error(err.message);
+    return false;
+  }
+
+  /** @type {import('resend').CreateEmailOptions} */
+  const payload = {
+    from:    getFromAddress(),
+    to:      toList,
+    subject,
+    html,
+    text:    text || stripHtml(html),
+  };
+
+  if (ccList.length)  payload.cc  = ccList;
+  if (bccList.length) payload.bcc = bccList;
+
+  const resolvedReplyTo = getReplyTo(replyTo);
+  if (resolvedReplyTo) payload.reply_to = resolvedReplyTo;
+
+  try {
+    const { data, error } = await resend.emails.send(payload);
+
+    if (error) {
+      console.error(
+        `[PeezuHub] Resend delivery failed (${subject}): ${JSON.stringify(error)}`
+      );
+      return false;
+    }
 
     console.log(
-      `[PeezuHub] Email sent via Courier -> ${toList.join(', ')} | ${subject} | requestIds=${results.join(', ')}`
+      `[PeezuHub] Email sent via Resend -> ${toList.join(', ')} | ${subject} | id=${data?.id}`
     );
     return true;
   } catch (err) {
-    const status = err?.response?.status;
-    const details = err?.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error(`[PeezuHub] Courier delivery failed (${subject})${status ? ` [${status}]` : ''}: ${details}`);
+    console.error(`[PeezuHub] Resend exception (${subject}): ${err.message}`);
     return false;
   }
 }
 
+// ─── fire-and-forget wrapper ──────────────────────────────────────────────────
+
+/**
+ * Queue an email to be sent asynchronously (non-blocking).
+ * Equivalent to the old queueEmail – all call-sites work unchanged.
+ *
+ * @param {{ to, cc, bcc, subject, html, text, replyTo }} payload
+ * @returns {true}
+ */
 function queueEmail(payload) {
   setImmediate(() => {
     sendEmail(payload).catch((err) => {
@@ -172,6 +174,8 @@ function queueEmail(payload) {
   });
   return true;
 }
+
+// ─── exports ─────────────────────────────────────────────────────────────────
 
 module.exports = {
   sendEmail,
