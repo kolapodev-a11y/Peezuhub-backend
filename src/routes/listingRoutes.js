@@ -497,60 +497,85 @@ router.post('/:id/reviews', auth, async (req, res) => {
 });
 
 router.post('/:id/report', optionalAuth, async (req, res) => {
-  const { reporterName, reporterEmail, reason } = req.body;
-  if (!reporterName || !reason) return res.status(400).json({ message: 'Reporter name and reason are required' });
-  const listing = await Listing.findById(req.params.id);
-  if (!listing) return res.status(404).json({ message: 'Listing not found' });
+  try {
+    const reporterName = String(req.body?.reporterName || '').trim();
+    const reporterEmail = String(req.body?.reporterEmail || '').trim().toLowerCase();
+    const reason = String(req.body?.reason || '').trim();
 
-  if (req.user && listing.user.toString() === req.user._id.toString()) {
-    return res.status(400).json({ message: 'You cannot report your own listing.' });
+    if (!reporterName || !reason) {
+      return res.status(400).json({ message: 'Reporter name and reason are required' });
+    }
+
+    const listing = await Listing.findById(req.params.id);
+    if (!listing) return res.status(404).json({ message: 'Listing not found' });
+
+    if (req.user && listing.user.toString() === req.user._id.toString()) {
+      return res.status(400).json({ message: 'You cannot report your own listing.' });
+    }
+
+    const report = await Report.create({
+      listing: listing._id,
+      reporterName,
+      reporterEmail,
+      reason,
+    });
+
+    const sideEffects = [];
+
+    sideEffects.push(
+      Notification.create({
+        type: 'report',
+        title: 'Listing reported',
+        message: `${listing.title} was reported by ${reporterName}`,
+        meta: {
+          listingId: listing._id.toString(),
+          reportId: report._id.toString(),
+          actionUrl: '/admin?tab=reports',
+        },
+      })
+    );
+
+    sideEffects.push(
+      Promise.resolve().then(() => {
+        const reportEmail = buildAdminAlertEmail({
+          variant: 'listing_report',
+          eyebrow: 'Listing reported',
+          title: 'A listing was reported by a user',
+          intro: 'A visitor flagged a listing for admin attention. Please inspect the listing details and decide whether additional moderation is required.',
+          fields: [
+            { label: 'Listing title', value: listing.title },
+            { label: 'Category', value: listing.category },
+            { label: 'Listing owner ID', value: listing.user?.toString?.() || String(listing.user || '') },
+            { label: 'Reporter', value: reporterName },
+            { label: 'Reporter email', value: reporterEmail || 'Not provided' },
+            { label: 'Reason', value: reason },
+            { label: 'Reported at', value: formatDateTime(report.createdAt) },
+          ],
+          actionLabel: 'Review admin dashboard',
+          callout: 'Reports can indicate fraud, spam, duplicate content or unsafe buyer/seller behaviour. Review promptly.',
+          footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
+        });
+
+        return queueEmail({
+          to: getAdminNotificationRecipients(),
+          subject: `${APP_NAME} report: ${listing.title}`,
+          html: reportEmail.html,
+          text: reportEmail.text,
+        });
+      })
+    );
+
+    const sideEffectResults = await Promise.allSettled(sideEffects);
+    const failedSideEffect = sideEffectResults.find((result) => result.status === 'rejected');
+    if (failedSideEffect) {
+      console.error('[PeezuHub] report side effect failed:', failedSideEffect.reason?.message || failedSideEffect.reason);
+    }
+
+    return res.status(201).json({ message: 'Report sent to admin successfully' });
+  } catch (error) {
+    console.error('[PeezuHub] report listing failed:', error.message);
+    return res.status(500).json({ message: 'Unable to submit report right now. Please try again.' });
   }
-
-  const report = await Report.create({
-    listing: listing._id,
-    reporterName,
-    reporterEmail,
-    reason,
-  });
-
-  await Notification.create({
-    type: 'report',
-    title: 'Listing reported',
-    message: `${listing.title} was reported by ${reporterName}`,
-    meta: {
-      listingId: listing._id.toString(),
-      reportId: report._id.toString(),
-      path: '/admin?tab=reports',
-    },
-  });
-
-  const reportEmail = buildAdminAlertEmail({
-    variant: 'listing_report',
-    eyebrow: 'Listing reported',
-    title: 'A listing was reported by a user',
-    intro: 'A visitor flagged a listing for admin attention. Please inspect the listing details and decide whether additional moderation is required.',
-    fields: [
-      { label: 'Listing title', value: listing.title },
-      { label: 'Category', value: listing.category },
-      { label: 'Listing owner ID', value: listing.user?.toString?.() || String(listing.user || '') },
-      { label: 'Reporter', value: reporterName },
-      { label: 'Reporter email', value: reporterEmail || 'Not provided' },
-      { label: 'Reason', value: reason },
-      { label: 'Reported at', value: formatDateTime(report.createdAt) },
-    ],
-    actionLabel: 'Review admin dashboard',
-    callout: 'Reports can indicate fraud, spam, duplicate content or unsafe buyer/seller behaviour. Review promptly.',
-    footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
-  });
-
-  queueEmail({
-    to: getAdminNotificationRecipients(),
-    subject: `${APP_NAME} report: ${listing.title}`,
-    html: reportEmail.html,
-    text: reportEmail.text,
-  });
-
-  res.status(201).json({ message: 'Report sent to admin successfully' });
 });
 
 module.exports = router;
