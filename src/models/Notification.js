@@ -8,8 +8,11 @@ const notificationSchema = new mongoose.Schema(
     message: { type: String, required: true },
     isRead: { type: Boolean, default: false },
     meta: { type: Object, default: {} },
+    notificationKey: { type: String, sparse: true },
   },
   { timestamps: true }
 );
+
+notificationSchema.index({ notificationKey: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model('Notification', notificationSchema);
