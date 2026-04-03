@@ -9,87 +9,24 @@
 const express = require('express');
 const axios = require('axios');
 const Listing = require('../models/Listing');
-const Notification = require('../models/Notification');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
-const { queueEmail } = require('../utils/sendEmail');
 const {
-  APP_NAME,
-  buildAdminAlertEmail,
-  buildPremiumConfirmEmail,
-  formatDateTime,
-  getAdminNotificationRecipients,
-} = require('../utils/emailTemplates');
+  PREMIUM_PRICE_KOBO,
+  PREMIUM_PRICE_NAIRA,
+  activatePremiumAccount,
+  classifyPaymentStatus,
+  createPremiumPendingNotifications,
+  dispatchPremiumActivationSideEffects,
+  getClientUrl,
+  getPaystackSecret,
+  hasActivePremium,
+  reconcilePendingPremium,
+  verifyPaystackReference,
+  clearPendingPremium,
+} = require('../utils/premiumPayments');
 
 const router = express.Router();
-
-const PREMIUM_PRICE_KOBO = 500_000;
-const PREMIUM_PRICE_NAIRA = 5_000;
-const PREMIUM_DURATION_DAYS = 30;
-
-function getPaystackSecret() {
-  return process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || null;
-}
-
-function getClientUrl() {
-  return (process.env.CLIENT_URL || '').split(',')[0].trim() || 'http://localhost:5173';
-}
-
-function hasActivePremium(user) {
-  return Boolean(
-    user?.premiumStatus === 'active' &&
-      user?.premiumExpiresAt &&
-      new Date(user.premiumExpiresAt) > new Date()
-  );
-}
-
-async function syncAllUserListingsPremium(userId, premiumExpiresAt, reference) {
-  const expiry = new Date(premiumExpiresAt);
-
-  await Listing.updateMany(
-    { user: userId },
-    {
-      $set: {
-        premiumRequested: true,
-        premiumPaymentStatus: 'paid',
-        paystackReference: reference,
-        featuredUntil: expiry,
-      },
-    }
-  );
-
-  await Listing.updateMany(
-    { user: userId, saleStatus: 'available', status: 'approved' },
-    { $set: { isFeatured: true, isVerified: true } }
-  );
-
-  await Listing.updateMany(
-    { user: userId, $or: [{ saleStatus: 'sold' }, { status: { $ne: 'approved' } }] },
-    { $set: { isFeatured: false, isVerified: false } }
-  );
-}
-
-async function claimPremiumEmailDispatch(userId, reference) {
-  const result = await User.updateOne(
-    {
-      _id: userId,
-      $or: [
-        { processedPremiumReference: { $exists: false } },
-        { processedPremiumReference: null },
-        { processedPremiumReference: '' },
-        { processedPremiumReference: { $ne: reference } },
-      ],
-    },
-    {
-      $set: {
-        processedPremiumReference: reference,
-        premiumReceiptSentAt: new Date(),
-      },
-    }
-  );
-
-  return result.modifiedCount > 0;
-}
 
 router.post('/paystack/initialize', auth, async (req, res, next) => {
   try {
@@ -108,6 +45,34 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
       });
     }
 
+    if (user.premiumStatus === 'pending' && user.premiumReference) {
+      const reconciliation = await reconcilePendingPremium(user, paystackSecret);
+
+      if (reconciliation.state === 'active') {
+        return res.status(400).json({
+          message:
+            'Your previous premium payment has already been confirmed. Your seller premium is active now.',
+        });
+      }
+
+      if (reconciliation.state === 'pending') {
+        return res.status(409).json({
+          message:
+            'You already have a premium payment awaiting Paystack confirmation. Please complete it, or wait a moment and refresh your profile.',
+        });
+      }
+
+      if (reconciliation.state === 'error') {
+        const status = reconciliation.error?.response?.status;
+        const message =
+          status && status >= 400 && status < 500
+            ? 'Unable to confirm the previous payment reference. Please contact support if this continues.'
+            : 'We could not confirm your previous premium payment status right now. Please try again in a few moments.';
+
+        return res.status(502).json({ message });
+      }
+    }
+
     const reference = `PZH-PREM-${Date.now()}-${user._id}`;
     const callbackUrl = `${getClientUrl()}/payment/callback?reference=${reference}`;
 
@@ -123,6 +88,9 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
           userId: user._id.toString(),
           plan: 'seller_premium',
           appliesTo: 'all_current_and_future_listings',
+          sourceApp: 'PeezuHub',
+          sourceAppSlug: 'peezuhub',
+          transactionKind: 'seller_premium_upgrade',
         },
       },
       {
@@ -137,24 +105,12 @@ router.post('/paystack/initialize', auth, async (req, res, next) => {
     user.premiumPlan = 'seller_premium';
     user.premiumStatus = 'pending';
     user.premiumReference = reference;
+    user.premiumActivatedAt = null;
+    user.premiumExpiresAt = null;
     user.premiumAmount = PREMIUM_PRICE_NAIRA;
     await user.save();
 
-    await Promise.all([
-      Notification.create({
-        type: 'premium_upgrade_pending',
-        title: 'Premium upgrade initiated',
-        message: `${user.name} started a seller premium upgrade payment.`,
-        meta: { userId: user._id.toString(), reference, path: '/admin?tab=notifications&filter=premium' },
-      }),
-      Notification.create({
-        user: user._id,
-        type: 'premium_user_pending',
-        title: 'Premium upgrade started',
-        message: 'Your seller premium payment has started. We will activate it immediately after Paystack confirms the payment.',
-        meta: { reference, path: '/profile?tab=notifications' },
-      }),
-    ]);
+    await createPremiumPendingNotifications(user, reference);
 
     res.json({ authorizationUrl: response.data.data.authorization_url, reference });
   } catch (err) {
@@ -171,115 +127,24 @@ router.get('/paystack/verify/:reference', auth, async (req, res, next) => {
     }
 
     const { reference } = req.params;
-
-    const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
-      headers: { Authorization: `Bearer ${paystackSecret}` },
-      timeout: 10_000,
-    });
-
-    const payment = response.data.data;
+    const payment = await verifyPaystackReference(reference, paystackSecret);
+    const paymentState = classifyPaymentStatus(payment?.status);
     const user = await User.findOne({ _id: req.user._id, premiumReference: reference });
 
     if (!user) {
       return res.status(404).json({ message: 'Payment reference not found for your account.' });
     }
 
-    if (payment.status === 'success') {
-      const alreadyActivated = Boolean(
-        user.premiumStatus === 'active' &&
-          user.premiumReference === reference &&
-          user.premiumExpiresAt &&
-          new Date(user.premiumExpiresAt) > new Date()
-      );
-
-      const activatedAt =
-        alreadyActivated && user.premiumActivatedAt
-          ? new Date(user.premiumActivatedAt)
-          : new Date();
-
-      const expiresAt =
-        alreadyActivated && user.premiumExpiresAt
-          ? new Date(user.premiumExpiresAt)
-          : new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1_000);
-
-      user.premiumPlan = 'seller_premium';
-      user.premiumStatus = 'active';
-      user.premiumActivatedAt = activatedAt;
-      user.premiumExpiresAt = expiresAt;
-      user.premiumAmount = PREMIUM_PRICE_NAIRA;
-      await user.save();
-
-      await syncAllUserListingsPremium(user._id, expiresAt, reference);
-
-      const shouldDispatchEmails = await claimPremiumEmailDispatch(user._id, reference);
-
-      if (shouldDispatchEmails) {
-        const adminEmail = buildAdminAlertEmail({
-          variant: 'premium_upgrade',
-          eyebrow: 'Premium upgrade paid',
-          title: 'A seller premium payment was completed',
-          intro: 'A user successfully completed a premium upgrade. Their current and future listings should now receive premium treatment until the expiry date.',
-          fields: [
-            { label: 'User name', value: user.name },
-            { label: 'User email', value: user.email },
-            { label: 'Plan', value: 'Seller premium (all current and future listings)' },
-            { label: 'Reference', value: reference },
-            { label: 'Expires', value: formatDateTime(expiresAt) },
-            { label: 'Paid at', value: formatDateTime(activatedAt) },
-          ],
-          actionLabel: 'Open admin dashboard',
-          callout: 'You can verify the account status in the admin dashboard and confirm that listing badges and top placement are active.',
-          footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
-        });
-
-        queueEmail({
-          to: getAdminNotificationRecipients(),
-          subject: `[${APP_NAME}] Premium upgrade paid – ${user.name}`,
-          html: adminEmail.html,
-          text: adminEmail.text,
-        });
-
-        const buyerEmail = buildPremiumConfirmEmail({
-          userName: user.name,
-          userEmail: user.email,
-          reference,
-          amountNaira: PREMIUM_PRICE_NAIRA,
-          activatedAt,
-          expiresAt,
-        });
-
-        queueEmail({
-          to: user.email,
-          subject: `✅ Your ${APP_NAME} Seller Premium is now active!`,
-          html: buyerEmail.html,
-          text: buyerEmail.text,
-        });
-
-        await Promise.all([
-          Notification.create({
-            type: 'premium_upgrade_paid',
-            title: 'Seller premium activated',
-            message: `${user.name} completed a premium upgrade. Listings will be featured until ${expiresAt.toLocaleDateString('en-NG')}.`,
-            meta: {
-              userId: user._id.toString(),
-              reference,
-              expiresAt: expiresAt.toISOString(),
-              path: '/admin?tab=notifications&filter=premium',
-            },
-          }),
-          Notification.create({
-            user: user._id,
-            type: 'premium_user_active',
-            title: 'Seller premium is active',
-            message: `Your seller premium is active until ${expiresAt.toLocaleDateString('en-NG')}. Current and future listings can now receive premium treatment.`,
-            meta: {
-              reference,
-              expiresAt: expiresAt.toISOString(),
-              path: '/profile?tab=notifications',
-            },
-          }),
-        ]);
-      }
+    if (paymentState === 'success') {
+      const activation = await activatePremiumAccount(user, reference);
+      await dispatchPremiumActivationSideEffects({
+        user,
+        reference,
+        activatedAt: activation.activatedAt,
+        expiresAt: activation.expiresAt,
+      });
+    } else if (paymentState === 'terminal') {
+      await clearPendingPremium(user);
     }
 
     const listings = await Listing.find({ user: req.user._id }).sort({ createdAt: -1 });

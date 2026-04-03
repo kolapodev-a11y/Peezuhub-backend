@@ -9,6 +9,7 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { auth, adminOnly } = require('../middleware/auth');
 const { adminRoleForEmail, syncUserRoleFromAdminEmails } = require('../utils/authRole');
+const { getPaystackSecret, reconcilePendingPremium } = require('../utils/premiumPayments');
 
 const router = express.Router();
 const APP_NAME = process.env.APP_NAME || 'PeezuHub';
@@ -291,6 +292,17 @@ router.post('/google', async (req, res) => {
 router.get('/me', auth, async (req, res) => {
   const freshUser = await User.findById(req.user._id).select('-passwordHash');
   await syncUserRoleFromAdminEmails(freshUser);
+
+  if (freshUser?.premiumStatus === 'pending' && freshUser?.premiumReference) {
+    const paystackSecret = getPaystackSecret();
+    if (paystackSecret) {
+      const reconciliation = await reconcilePendingPremium(freshUser, paystackSecret);
+      if (reconciliation.state === 'error') {
+        console.error('[PeezuHub] Failed to reconcile pending premium on /auth/me:', reconciliation.error?.message);
+      }
+    }
+  }
+
   res.json({ user: serializeUser(freshUser) });
 });
 
