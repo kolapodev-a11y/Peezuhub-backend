@@ -44,4 +44,8 @@ const listingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+listingSchema.index({ status: 1, saleStatus: 1, createdAt: -1 });
+listingSchema.index({ status: 1, saleStatus: 1, isFeatured: 1, featuredUntil: -1, createdAt: -1 });
+listingSchema.index({ status: 1, saleStatus: 1, state: 1, category: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Listing', listingSchema);
