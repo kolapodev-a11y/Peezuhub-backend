@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const sharp = require('sharp');
 const Listing = require('../models/Listing');
 const Report = require('../models/Report');
 const Notification = require('../models/Notification');
@@ -17,14 +18,44 @@ const {
 } = require('../utils/emailTemplates');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
+const MAX_PHOTOS = 4;
+const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
+const LIST_CARD_SELECT =
+  'title category description state city locationLabel startingPrice priceLabel photos status saleStatus isFeatured isVerified averageRating reviewsCount user createdAt';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_SIZE, files: MAX_PHOTOS },
+  fileFilter(_req, file, callback) {
+    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+      callback(new Error('Only image files can be uploaded.'));
+      return;
+    }
+
+    callback(null, true);
+  },
+});
 
 function sanitizeWhatsapp(value = '') {
   return value.replace(/[^\d]/g, '');
 }
 
-function toBase64Photos(files = []) {
-  return files.map((file) => `data:${file.mimetype};base64,${file.buffer.toString('base64')}`);
+function escapeRegex(value = '') {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function optimisePhotoFiles(files = []) {
+  return Promise.all(
+    files.map(async (file) => {
+      const processedBuffer = await sharp(file.buffer, { failOnError: false })
+        .rotate()
+        .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 78, effort: 4 })
+        .toBuffer();
+
+      return `data:image/webp;base64,${processedBuffer.toString('base64')}`;
+    })
+  );
 }
 
 function updateRatingStats(listing) {
@@ -64,8 +95,8 @@ function getPublicSort(sort = 'newest') {
 function hasActiveSellerPremium(user) {
   return Boolean(
     user?.premiumStatus === 'active' &&
-    user?.premiumExpiresAt &&
-    new Date(user.premiumExpiresAt) > new Date()
+      user?.premiumExpiresAt &&
+      new Date(user.premiumExpiresAt) > new Date()
   );
 }
 
@@ -116,32 +147,64 @@ function buildAdminNotificationScope(adminUserId) {
   };
 }
 
-router.get('/meta/options', async (_req, res) => {
-  const approved = await Listing.find({ status: 'approved', saleStatus: 'available' }).select('category state');
-  const categoryCounts = CATEGORIES.map((name) => ({
-    name,
-    count: approved.filter((item) => item.category === name).length,
-  }));
-  const stateCounts = NIGERIAN_STATES.filter((state) => state !== 'All States').map((name) => ({
-    name,
-    count: approved.filter((item) => item.state === name).length,
-  }));
-  res.json({ categories: categoryCounts, states: stateCounts, disclaimer: SAFETY_DISCLAIMER });
+function shapeListingCard(listing) {
+  return {
+    ...listing,
+    photos: Array.isArray(listing.photos) ? listing.photos.slice(0, MAX_PHOTOS) : [],
+  };
+}
+
+router.get('/meta/options', async (_req, res, next) => {
+  try {
+    const [categoryCountsRaw, stateCountsRaw] = await Promise.all([
+      Listing.aggregate([
+        { $match: { status: 'approved', saleStatus: 'available' } },
+        { $group: { _id: '$category', count: { $sum: 1 } } },
+      ]),
+      Listing.aggregate([
+        { $match: { status: 'approved', saleStatus: 'available' } },
+        { $group: { _id: '$state', count: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const categoryCountMap = new Map(categoryCountsRaw.map((item) => [item._id, item.count]));
+    const stateCountMap = new Map(stateCountsRaw.map((item) => [item._id, item.count]));
+
+    const categoryCounts = CATEGORIES.map((name) => ({
+      name,
+      count: categoryCountMap.get(name) || 0,
+    }));
+
+    const stateCounts = NIGERIAN_STATES.filter((state) => state !== 'All States').map((name) => ({
+      name,
+      count: stateCountMap.get(name) || 0,
+    }));
+
+    res.json({ categories: categoryCounts, states: stateCounts, disclaimer: SAFETY_DISCLAIMER });
+  } catch (error) {
+    next(error);
+  }
 });
 
-router.get('/featured', async (_req, res) => {
-  const featured = await Listing.find({
-    status: 'approved',
-    saleStatus: 'available',
-    isFeatured: true,
-    premiumPaymentStatus: 'paid',
-    featuredUntil: { $gt: new Date() },
-  })
-    .sort({ featuredUntil: -1, createdAt: -1 })
-    .limit(12)
-    .populate('user', 'name avatar role');
+router.get('/featured', async (_req, res, next) => {
+  try {
+    const featured = await Listing.find({
+      status: 'approved',
+      saleStatus: 'available',
+      isFeatured: true,
+      premiumPaymentStatus: 'paid',
+      featuredUntil: { $gt: new Date() },
+    })
+      .select(LIST_CARD_SELECT)
+      .sort({ featuredUntil: -1, createdAt: -1 })
+      .limit(12)
+      .populate('user', 'name avatar role')
+      .lean();
 
-  res.json(featured);
+    res.json(featured.map(shapeListingCard));
+  } catch (error) {
+    next(error);
+  }
 });
 
 router.get('/mine', auth, async (req, res) => {
@@ -165,7 +228,9 @@ router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
     allListings,
   ] = await Promise.all([
     Listing.find({ status: 'pending' }).populate('user', 'name email avatar role').sort({ createdAt: -1 }),
-    Report.find({ status: 'open' }).populate({ path: 'listing', populate: { path: 'user', select: 'name email role' } }).sort({ createdAt: -1 }),
+    Report.find({ status: 'open' })
+      .populate({ path: 'listing', populate: { path: 'user', select: 'name email role' } })
+      .sort({ createdAt: -1 }),
     Notification.countDocuments({ ...buildAdminNotificationScope(_req.user._id), isRead: false }),
     Listing.countDocuments({ status: 'pending' }),
     Message.countDocuments(),
@@ -194,207 +259,255 @@ router.get('/admin/dashboard', auth, adminOnly, async (_req, res) => {
   });
 });
 
-router.get('/', async (req, res) => {
-  const {
-    search = '',
-    state,
-    category,
-    sort = 'newest',
-    status = 'approved',
-    saleStatus = 'available',
-  } = req.query;
+router.get('/', async (req, res, next) => {
+  try {
+    const {
+      search = '',
+      state,
+      category,
+      sort = 'newest',
+      status = 'approved',
+      saleStatus = 'available',
+    } = req.query;
 
-  const query = {};
-  if (status) query.status = status;
-  if (saleStatus && saleStatus !== 'All') query.saleStatus = saleStatus;
-  if (state && state !== 'All States') query.state = state;
-  if (category && category !== 'All Categories') query.category = category;
+    const query = {};
+    if (status) query.status = status;
+    if (saleStatus && saleStatus !== 'All') query.saleStatus = saleStatus;
+    if (state && state !== 'All States') query.state = state;
+    if (category && category !== 'All Categories') query.category = category;
 
-  if (search) {
-    query.$or = [
-      { title: { $regex: search, $options: 'i' } },
-      { description: { $regex: search, $options: 'i' } },
-      { city: { $regex: search, $options: 'i' } },
-    ];
+    const normalizedSearch = String(search || '').trim();
+    if (normalizedSearch) {
+      const safeSearch = new RegExp(escapeRegex(normalizedSearch), 'i');
+      query.$or = [
+        { title: safeSearch },
+        { description: safeSearch },
+        { city: safeSearch },
+      ];
+    }
+
+    const listings = await Listing.find(query)
+      .select(LIST_CARD_SELECT)
+      .populate('user', 'name avatar role')
+      .sort(getPublicSort(sort))
+      .lean();
+
+    res.json(listings.map(shapeListingCard));
+  } catch (error) {
+    next(error);
   }
-
-  const listings = await Listing.find(query)
-    .populate('user', 'name avatar role')
-    .sort(getPublicSort(sort));
-
-  res.json(listings);
 });
 
 router.get('/:id', async (req, res) => {
-  const listing = await Listing.findById(req.params.id).populate('user', 'name email avatar premiumStatus premiumExpiresAt role');
+  const listing = await Listing.findById(req.params.id).populate(
+    'user',
+    'name email avatar role premiumStatus premiumExpiresAt'
+  );
   if (!listing) return res.status(404).json({ message: 'Listing not found' });
   res.json(listing);
 });
 
-router.post('/', auth, upload.array('photos', 4), async (req, res) => {
-  const {
-    title,
-    category,
-    description,
-    state,
-    city,
-    locationLabel,
-    startingPrice,
-    priceLabel,
-    whatsapp,
-    email,
-    phone,
-    safetyAccepted,
-  } = req.body;
+router.post('/', auth, upload.array('photos', MAX_PHOTOS), async (req, res, next) => {
+  try {
+    const {
+      title,
+      category,
+      description,
+      state,
+      city,
+      locationLabel,
+      startingPrice,
+      priceLabel,
+      whatsapp,
+      email,
+      phone,
+      safetyAccepted,
+    } = req.body;
 
-  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
-    return res.status(400).json({ message: 'All required fields must be filled' });
+    if (
+      !title ||
+      !category ||
+      !description ||
+      !state ||
+      !city ||
+      startingPrice === undefined ||
+      startingPrice === '' ||
+      !priceLabel ||
+      !whatsapp
+    ) {
+      return res.status(400).json({ message: 'All required fields must be filled' });
+    }
+
+    if (!isValidCategory(category)) {
+      return res.status(400).json({ message: 'Please choose a valid category.' });
+    }
+
+    if (String(safetyAccepted) !== 'true') {
+      return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
+    }
+
+    if ((req.files || []).length > MAX_PHOTOS) {
+      return res.status(400).json({ message: `You can upload a maximum of ${MAX_PHOTOS} photos.` });
+    }
+
+    const photos = await optimisePhotoFiles(req.files || []);
+    if (!photos.length) return res.status(400).json({ message: 'At least one photo is required' });
+
+    const scamHit = detectScamText(`${title} ${description}`);
+    const moderationStatus = scamHit ? 'rejected' : 'pending';
+    const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
+
+    const listing = await Listing.create({
+      user: req.user._id,
+      title,
+      category,
+      description,
+      state,
+      city,
+      locationLabel,
+      startingPrice: Number(startingPrice),
+      priceLabel,
+      photos,
+      contact: {
+        whatsapp: sanitizeWhatsapp(whatsapp),
+        email: email || '',
+        phone: phone || '',
+      },
+      status: moderationStatus,
+      rejectionReason,
+      saleStatus: 'available',
+    });
+
+    syncListingPremiumState(listing, req.user);
+    await listing.save();
+
+    await Notification.create({
+      type: 'submission',
+      title: 'New listing submitted',
+      message: `${title} was submitted in ${city}, ${state}`,
+      meta: {
+        listingId: listing._id.toString(),
+        status: moderationStatus,
+        path: '/admin?tab=pending',
+      },
+    });
+
+    const newListingEmail = buildAdminAlertEmail({
+      variant: 'listing_approval',
+      eyebrow: 'New listing submitted',
+      title: 'A new listing needs moderation',
+      intro: `A user just submitted a listing on ${APP_NAME}. Review it in the admin dashboard and decide whether to approve or reject it.`,
+      fields: [
+        { label: 'Listing title', value: title },
+        { label: 'Category', value: category },
+        { label: 'Location', value: `${city}, ${state}` },
+        { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
+        { label: 'Seller', value: req.user.name },
+        { label: 'Seller email', value: req.user.email },
+        { label: 'Moderation status', value: moderationStatus },
+        { label: 'Submitted at', value: formatDateTime(listing.createdAt) },
+      ],
+      actionLabel: 'Open admin dashboard',
+      callout: 'Open the admin dashboard to verify the content, inspect the photos and take moderation action quickly.',
+      footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
+    });
+
+    queueEmail({
+      to: getAdminNotificationRecipients(),
+      subject: `${APP_NAME} listing submitted: ${title}`,
+      html: newListingEmail.html,
+      text: newListingEmail.text,
+    });
+
+    res.status(201).json({ listing, paymentNeeded: false });
+  } catch (error) {
+    next(error);
   }
+});
 
-  if (!isValidCategory(category)) {
-    return res.status(400).json({ message: 'Please choose a valid category.' });
-  }
+router.patch('/:id', auth, upload.array('photos', MAX_PHOTOS), async (req, res, next) => {
+  try {
+    const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
+    if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
 
-  if (String(safetyAccepted) !== 'true') {
-    return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
-  }
+    const {
+      title,
+      category,
+      description,
+      state,
+      city,
+      locationLabel,
+      startingPrice,
+      priceLabel,
+      whatsapp,
+      email,
+      phone,
+      keepPhotos,
+      safetyAccepted,
+    } = req.body;
 
-  const photos = toBase64Photos(req.files || []);
-  if (!photos.length) return res.status(400).json({ message: 'At least one photo is required' });
+    const preservedPhotos = parsePhotosField(keepPhotos);
+    const uploadedPhotos = await optimisePhotoFiles(req.files || []);
 
-  const scamHit = detectScamText(`${title} ${description}`);
-  const moderationStatus = scamHit ? 'rejected' : 'pending';
-  const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
+    if (
+      !title ||
+      !category ||
+      !description ||
+      !state ||
+      !city ||
+      startingPrice === undefined ||
+      startingPrice === '' ||
+      !priceLabel ||
+      !whatsapp
+    ) {
+      return res.status(400).json({ message: 'All required fields must be filled' });
+    }
 
-  const listing = await Listing.create({
-    user: req.user._id,
-    title,
-    category,
-    description,
-    state,
-    city,
-    locationLabel,
-    startingPrice: Number(startingPrice),
-    priceLabel,
-    photos,
-    contact: {
+    if (!isValidCategory(category)) {
+      return res.status(400).json({ message: 'Please choose a valid category.' });
+    }
+
+    if (String(safetyAccepted) !== 'true') {
+      return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
+    }
+
+    if (preservedPhotos.length + uploadedPhotos.length > MAX_PHOTOS) {
+      return res.status(400).json({ message: `You can keep or upload only ${MAX_PHOTOS} photos in total.` });
+    }
+
+    const nextPhotos = [...preservedPhotos, ...uploadedPhotos];
+
+    if (!nextPhotos.length) {
+      return res.status(400).json({ message: 'Keep at least one photo or upload a new one.' });
+    }
+
+    const scamHit = detectScamText(`${title} ${description}`);
+    const moderationStatus = scamHit ? 'rejected' : 'pending';
+    const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
+
+    listing.title = title;
+    listing.category = category;
+    listing.description = description;
+    listing.state = state;
+    listing.city = city;
+    listing.locationLabel = locationLabel || '';
+    listing.startingPrice = Number(startingPrice);
+    listing.priceLabel = priceLabel;
+    listing.photos = nextPhotos;
+    listing.contact = {
       whatsapp: sanitizeWhatsapp(whatsapp),
       email: email || '',
       phone: phone || '',
-    },
-    status: moderationStatus,
-    rejectionReason,
-    saleStatus: 'available',
-  });
+    };
+    listing.status = moderationStatus;
+    listing.rejectionReason = rejectionReason;
 
-  syncListingPremiumState(listing, req.user);
-  await listing.save();
-
-  await Notification.create({
-    type: 'submission',
-    title: 'New listing submitted',
-    message: `${title} was submitted in ${city}, ${state}`,
-    meta: {
-      listingId: listing._id.toString(),
-      status: moderationStatus,
-      path: '/admin?tab=pending',
-    },
-  });
-
-  const newListingEmail = buildAdminAlertEmail({
-    variant: 'listing_approval',
-    eyebrow: 'New listing submitted',
-    title: 'A new listing needs moderation',
-    intro: `A user just submitted a listing on ${APP_NAME}. Review it in the admin dashboard and decide whether to approve or reject it.`,
-    fields: [
-      { label: 'Listing title', value: title },
-      { label: 'Category', value: category },
-      { label: 'Location', value: `${city}, ${state}` },
-      { label: 'Price', value: `₦${Number(startingPrice).toLocaleString('en-NG')}` },
-      { label: 'Seller', value: req.user.name },
-      { label: 'Seller email', value: req.user.email },
-      { label: 'Moderation status', value: moderationStatus },
-      { label: 'Submitted at', value: formatDateTime(listing.createdAt) },
-    ],
-    actionLabel: 'Open admin dashboard',
-    callout: 'Open the admin dashboard to verify the content, inspect the photos and take moderation action quickly.',
-    footerNote: 'You are receiving this because you are the PeezuHub admin contact for operational notifications.',
-  });
-
-  queueEmail({
-    to: getAdminNotificationRecipients(),
-    subject: `${APP_NAME} listing submitted: ${title}`,
-    html: newListingEmail.html,
-    text: newListingEmail.text,
-  });
-
-  res.status(201).json({ listing, paymentNeeded: false });
-});
-
-router.patch('/:id', auth, upload.array('photos', 4), async (req, res) => {
-  const listing = await Listing.findOne({ _id: req.params.id, user: req.user._id });
-  if (!listing) return res.status(404).json({ message: 'Listing not found or does not belong to you.' });
-
-  const {
-    title,
-    category,
-    description,
-    state,
-    city,
-    locationLabel,
-    startingPrice,
-    priceLabel,
-    whatsapp,
-    email,
-    phone,
-    keepPhotos,
-    safetyAccepted,
-  } = req.body;
-
-  const preservedPhotos = parsePhotosField(keepPhotos);
-  const uploadedPhotos = toBase64Photos(req.files || []);
-  const nextPhotos = [...preservedPhotos, ...uploadedPhotos].slice(0, 4);
-
-  if (!title || !category || !description || !state || !city || startingPrice === undefined || startingPrice === '' || !priceLabel || !whatsapp) {
-    return res.status(400).json({ message: 'All required fields must be filled' });
+    syncListingPremiumState(listing, req.user);
+    await listing.save();
+    res.json(listing);
+  } catch (error) {
+    next(error);
   }
-
-  if (!isValidCategory(category)) {
-    return res.status(400).json({ message: 'Please choose a valid category.' });
-  }
-
-  if (String(safetyAccepted) !== 'true') {
-    return res.status(400).json({ message: 'Safety responsibility confirmation is required' });
-  }
-
-  if (!nextPhotos.length) {
-    return res.status(400).json({ message: 'Keep at least one photo or upload a new one.' });
-  }
-
-  const scamHit = detectScamText(`${title} ${description}`);
-  const moderationStatus = scamHit ? 'rejected' : 'pending';
-  const rejectionReason = scamHit ? `Auto-rejected for suspicious keyword: ${scamHit}` : '';
-
-  listing.title = title;
-  listing.category = category;
-  listing.description = description;
-  listing.state = state;
-  listing.city = city;
-  listing.locationLabel = locationLabel || '';
-  listing.startingPrice = Number(startingPrice);
-  listing.priceLabel = priceLabel;
-  listing.photos = nextPhotos;
-  listing.contact = {
-    whatsapp: sanitizeWhatsapp(whatsapp),
-    email: email || '',
-    phone: phone || '',
-  };
-  listing.status = moderationStatus;
-  listing.rejectionReason = rejectionReason;
-
-  syncListingPremiumState(listing, req.user);
-  await listing.save();
-  res.json(listing);
 });
 
 router.patch('/:id/sale-status', auth, async (req, res) => {
